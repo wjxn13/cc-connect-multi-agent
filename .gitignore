@@ -1,0 +1,27 @@
+# ===== 凭证与真实配置（绝对不要提交）=====
+config.toml
+*.token
+*.secret
+.env
+.env.*
+
+# ===== cc-connect 运行时产物 =====
+logs/
+sessions/
+run/
+crons/
+timers/
+*.log
+*.bak
+*.bak2*
+
+# ===== 本机排查产生的临时文件 =====
+*.tmp
+__pycache__/
+*.pyc
+
+# ===== 编辑器 / 系统 =====
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

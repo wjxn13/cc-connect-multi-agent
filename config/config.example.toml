@@ -1,0 +1,136 @@
+# =============================================================================
+# cc-connect 多 agent 微信桥接 · 配置样例（已脱敏）
+# =============================================================================
+#
+# 作用：把三个不同的 AI agent（Claude Code / DeepSeek Harness / WorkBuddy）
+#       接到同一个微信机器人入口，共用一个微信号与用户对话。
+#
+# 使用方法：
+#   1. 复制到 ~/.cc-connect/config.toml
+#   2. 替换所有 <尖括号> 占位符
+#   3. cc-connect daemon stop   # 注意：本工具 stop 常不真正杀进程，见 docs/04
+#      cc-connect daemon start
+#
+# ⚠️ 核心前提（务必先读 docs/05-能力边界实测.md）：
+#   三个 project 共用同一个微信 bot token 时，一条用户消息会被**原样投给每个
+#   project**（扇出，而非路由）。cc-connect 没有「按内容/@对象 选人投递」的能力，
+#   「谁该回答」只能靠 agent 自己读消息后判断。这是本方案最大的架构约束。
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# 全局：agent 之间的跨项目拨号（信使）
+# -----------------------------------------------------------------------------
+# 让 A agent 能主动找 B agent，且 B 不需要在线 —— cc-connect 会把消息转过去并等回复。
+[relay]
+timeout_secs = 120
+# visibility 只控制「群聊里的额外回声」；私聊（dm）场景下是空操作。
+visibility = "full"
+
+
+# -----------------------------------------------------------------------------
+# 全局：只发正式回复，不把思考过程/工具进度当作独立消息发出
+# -----------------------------------------------------------------------------
+# 必要性：部分 agent（尤其带推理模式的）会把思考文字混进回复正文，
+#         导致「整段恰好等于 NO_REPLY」的静默判定失效、思考被真的发到微信。
+[display]
+thinking_messages = false
+tool_messages = false
+
+
+# =============================================================================
+# Project 1：Claude Code（type = "claudecode"）
+# =============================================================================
+[[projects]]
+name = "my-project"
+# ⚠️ admin_from 必须是**字符串**。写成 TOML 表（[projects.admin_from]）会让整个
+#    配置解析失败、服务起不来，且日志只有反复的 instance lock，极难定位。
+admin_from = "<YOUR_OPENID>@im.wechat"
+
+[projects.agent]
+type = "claudecode"
+
+[projects.agent.options]
+work_dir = "C:/Users/<YOU>"
+# mode 必须显式设为 bypassPermissions：
+#   "default" 的语义是「每次工具调用都要人工确认」，而桥接是无值守的 ——
+#   agent 发出权限请求后没人点「允许」，回合就永久挂起，微信侧表现为「完全没回」。
+#   风险边界 = 本 project 平台配置里的 allow_from 白名单，请勿外借账号。
+mode = "bypassPermissions"
+# 点名制提示词：cc-connect 检测到回复整体等于 NO_REPLY 时判为静默、不发出。
+# 注意这是**提示词工程**，不是桥接的内置开关（NO_REPLY 这个字面量在二进制里搜不到）。
+append_system_prompt = '这是一个「微信多 agent 桥接」会话，可能存在多个 AI 同时收到同一条消息。路由规则：1) 若用户消息以 @dsh 开头（点名 DeepSeek Harness），你什么都不要回答，只输出一行 NO_REPLY（不要有任何其他文字、标点或说明）；2) 若消息以 @claude 开头，去掉这个前缀后正常作答；3) 消息没有 @ 前缀时，正常作答。'
+
+[[projects.platforms]]
+type = "weixin"
+
+[projects.platforms.options]
+token = "<YOUR_BOT_TOKEN>"
+base_url = "https://ilinkai.weixin.qq.com"
+account_id = "<YOUR_BOT_ACCOUNT_ID>"
+# allow_from 的语义是「**谁**可以给这个 project 发消息」，按发送者过滤。
+# 把它设成某个不存在的 ID，就等于给该 project 装了一个「入站总开关」（关）。
+allow_from = "<YOUR_OPENID>@im.wechat"
+clean_reply = true
+
+
+# =============================================================================
+# Project 2：DeepSeek Harness（type = "acp"）
+# =============================================================================
+# DSH 自带标准 ACP server：dsh --profile acp（automation-only JSON-RPC stdio）
+[[projects]]
+name = "my-dsh"
+
+[projects.agent]
+type = "acp"
+
+[projects.agent.options]
+work_dir = "C:/Users/<YOU>"
+command = "<NODE_EXE_PATH>"
+# args 结构 = [中间层脚本, node, agent 入口, ...agent 参数]
+# 中间层 acp-thought-filter.js 的作用：丢弃 agent_thought_chunk（思考块）。
+# 原因：cc-connect 的 ACP 适配器不区分「思考块」与「正文块」，会把两者拼成同一条
+#       回复，于是「整段恰好等于 NO_REPLY」的静默判定失效，思考独白被发到微信。
+args = ["<REPO>/scripts/acp-thought-filter.js", "<NODE_EXE_PATH>", "<DSH_ENTRY>/lib/bin.js", "--profile", "acp"]
+display_name = "DSH"
+
+[[projects.platforms]]
+type = "weixin"
+
+[projects.platforms.options]
+token = "<YOUR_BOT_TOKEN>"
+base_url = "https://ilinkai.weixin.qq.com"
+account_id = "<YOUR_BOT_ACCOUNT_ID>"
+allow_from = "<YOUR_OPENID>@im.wechat"
+clean_reply = true
+
+
+# =============================================================================
+# Project 3：WorkBuddy（type = "acp"，走它内置的 CodeBuddy CLI）
+# =============================================================================
+# 原理：WorkBuddy 桌面版本体就是 CodeBuddy CLI，支持标准 ACP
+#       （--acp --acp-transport stdio），可直接对接。
+# 必须用 --acp：CLI 的 -p / --serve 路径会绑定一个按机器固定的端口（会被桌面版
+#              会话占用）并永久挂起；--acp 不绑该端口。
+[[projects]]
+name = "my-workbuddy"
+
+[projects.agent]
+type = "acp"
+
+[projects.agent.options]
+# 用独立目录，避免读到家目录下给其他 agent 写的 CLAUDE.md 规则（否则会串规则）
+work_dir = "C:/Users/<YOU>/wb-agent"
+command = "<NODE_EXE_PATH>"
+args = ["<REPO>/scripts/acp-thought-filter.js", "<NODE_EXE_PATH>", "<CODEBUDDY_ENTRY>", "--acp", "--acp-transport", "stdio", "--permission-mode", "bypassPermissions", "--mcp-config", '{"mcpServers":{}}']
+display_name = "WorkBuddy"
+
+[[projects.platforms]]
+type = "weixin"
+
+[projects.platforms.options]
+token = "<YOUR_BOT_TOKEN>"
+base_url = "https://ilinkai.weixin.qq.com"
+account_id = "<YOUR_BOT_ACCOUNT_ID>"
+allow_from = "<YOUR_OPENID>@im.wechat"
+clean_reply = true
