@@ -165,7 +165,7 @@ msg_id=7505310717695579528 → 3 次 message received → 3 次 turn complete
 | `hooks/` | 前置拦截钩子本体 + 两份平台配置样例（含「引号规则」的差异说明） |
 | `patches/` | 给 cc-connect 打的引擎侧补丁（6 个提交，含应用方法与上游现状） |
 | `config/config.example.toml` | 三 agent 接入的完整配置样例（已脱敏） |
-| `scripts/` | 14 个脚本：探针/诊断（ACP 握手、权限、会话读取）+ 3 个 memorix 记忆层验证 + L2 钩子离线回归测试 |
+| `scripts/` | 15 个脚本：探针/诊断（ACP 握手、权限、会话读取）+ 3 个 memorix 记忆层验证 + L2 钩子离线回归测试 + 公开前审计扫描器 |
 
 ---
 
@@ -286,4 +286,25 @@ python scripts/l2_hook_tests.py    # 期望末行：结果：31/31 通过
 
 **未脱敏的是软件安装路径**（如 `D:/dsh`、`D:/npm-global`、`D:/workbudy`）—— 它们不含个人信息，
 且是脚本能跑起来所必需的。若你的安装位置不同，按 `config/config.example.toml` 里的注释逐项替换即可。
+
+### 公开前审计（脚本已随仓库提供）
+
+`scripts/audit-before-public.py` 是个通用扫描器：它读**git 对象**而不是工作区文件，所以
+**HEAD 全部文件 + 全部历史 blob（含已删过的）** 都扫得到，命中凭证 / 真实标识 / 内网地址 /
+本机用户名路径时逐条列出。
+
+```bash
+python scripts/audit-before-public.py             # 审计当前仓库
+python scripts/audit-before-public.py D:/别的仓库   # 审计任意仓库
+```
+
+> ⚠️ **两条实测结论，自己公开仓库前务必知道**（都是踩出来的）：
+>
+> 1. **改写历史 ≠ 抹掉历史。** `git filter-branch` 重写 + `--force-with-lease` 强推**不会**删掉
+>    远程的旧对象 —— 旧提交仍可按 SHA 直链取到、内容原样可读。**唯一真正的清除办法是删库重建。**
+> 2. 所以正确顺序是「**先审计 → 先脱敏 → 再首次推送**」，别推完再改。
+>
+> 另外两个扫描盲区：**.lnk 之类的二进制里路径是 UTF-16 存的**（普通文本扫描器查不到，要额外查
+> `'字符串'.encode('utf-16-le')`）；**审计工具自身的正则与文档里的占位符会被自己命中**，
+> 看报告要能区分「真残留」和「`<USER>` 这类占位符」。
 
