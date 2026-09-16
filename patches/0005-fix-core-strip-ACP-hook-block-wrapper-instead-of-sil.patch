@@ -1,0 +1,263 @@
+From f3d66d44f2898a7c807dbecc860e2992d8dc2d27 Mon Sep 17 00:00:00 2001
+From: wjxn13 <yqyj33@qq.com>
+Date: Wed, 16 Sep 2026 22:31:17 +0800
+Subject: [PATCH 5/6] fix(core): strip ACP hook-block wrapper instead of
+ silencing the whole reply
+
+On ACP-backed agents (CodeBuddy CLI / DSH) the hook-block notice of one turn is
+carried into the next turn's reply and concatenated with it, with no separator:
+
+  Operation stopped by hook: NO_REPLY<real reply>
+
+The previous strategy matched that prefix and silenced the entire response, so a
+real reply got swallowed. Reproduced live 2/2 before this fix:
+
+  turn A (blocked)   tools=0 response_len=35  silent=true
+  turn B (poisoned)  tools=2 response_len=270 silent=true   <- real reply lost
+
+Fix: for the ACP shape only, strip "Operation stopped by hook: " plus the
+NO_REPLY reason marker, then decide silence on what remains:
+
+  remaining empty      -> silent (pure block; behaviour unchanged)
+  remaining non-empty  -> deliver the real reply
+
+Order matters: strip first, then check. The Claude Code shape
+("UserPromptSubmit operation blocked by hook: ...") is deliberately NOT stripped
+- that text is entirely wrapper - so it still falls through to
+isHookBlockedResponse and is silenced as before.
+
+Caveat: changing the hook's reason text away from NO_REPLY disables detection;
+core/hook_block_silence_test.go pins that with a dedicated case.
+
+Coverage added:
+- TestStripHookBlockWrapper (7 cases)
+- TestProcessInteractiveEvents_StaleWrapperDoesNotEatReply
+- "acp-pure-block-no-reply" added to the silence table
+
+Reverse control: short-circuiting stripHookBlockWrapper makes both new tests
+fail (silent=true, nothing delivered), so they carry real discriminating power.
+
+Live end-to-end re-run after deploying the patched binary (three consecutive
+turns on the same session):
+
+  A (blocked)   tools=0 response_len=35 silent=true    suppressed
+  B (poisoned)  tools=2 response_len=46 silent=false   delivered; the 35-byte
+                                                       wrapper was stripped
+  C (clean)     tools=2 response_len=37 silent=false   untouched
+
+The B length is the arithmetic proof: 46 == len("B<confirm text>"), i.e. exactly
+the text left after removing the 35-byte wrapper (35 + 46 == 81 would be the
+unstripped length).
+---
+ core/engine.go                  | 74 +++++++++++++++++++++++---
+ core/hook_block_silence_test.go | 93 +++++++++++++++++++++++++++++++++
+ 2 files changed, 161 insertions(+), 6 deletions(-)
+
+diff --git a/core/engine.go b/core/engine.go
+index 9629dd4..ce99752 100644
+--- a/core/engine.go
++++ b/core/engine.go
+@@ -5034,17 +5034,38 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
+ 				}
+ 			}
+ 
+-			// Detect NO_REPLY marker on the base response (before indicators/footer are appended).
+-			// Three cases:
+-			//   1. bare marker (isSilentReply)               → fully silent
+-			//   2. trailing marker with non-empty reasoning  → strip marker, deliver reasoning
+-			//   3. trailing marker with empty strip result   → fully silent
++			// Detect NO_REPLY marker / hook-block wrapper on the base response
++			// (before indicators/footer are appended).
++			//
++			// ⚠️ 顺序是关键：**必须先剥离跨轮携带的钩子阻断包装，再判静默**。
++			// ACP 平台（2026-09-16 实测 CodeBuddy CLI）会把上一轮被拦的包装文本带到本轮
++			// 回复前面并与真回复直接粘连（"Operation stopped by hook: NO_REPLY" + 真回复）。
++			// 若先跑 isHookBlockedResponse，整条会因前缀命中而静默 —— 真回复被吞掉。
++			//
++			// 四种落点：
++			//   1. 纯阻断包装（整段就是包装）  → 静默
++			//   2. 包装 + 真回复（粘连）      → 剥离后正常投递真回复
++			//   3. 裸 NO_REPLY 标记           → 静默
++			//   4. 尾随 NO_REPLY 且有理由      → 剥离标记、投递理由
+ 			// History records the ORIGINAL baseResponse so the agent retains context of its own
+ 			// decision; only the outbound platform text gets rewritten/suppressed.
+ 			session.AddHistory("assistant", baseResponse)
+ 			sessions.Save()
+ 
+-			isSilent := isSilentReply(baseResponse) || isHookBlockedResponse(baseResponse)
++			isSilent := false
++			if stripped, ok := stripHookBlockWrapper(baseResponse); ok {
++				if strings.TrimSpace(stripped) == "" {
++					isSilent = true
++				} else {
++					baseResponse = stripped
++					cleanResponse = stripped
++				}
++			}
++
++			if !isSilent && (isSilentReply(baseResponse) || isHookBlockedResponse(baseResponse)) {
++				isSilent = true
++			}
++
+ 			if !isSilent {
+ 				if stripped, ok := stripTrailingSilent(baseResponse); ok {
+ 					if strings.TrimSpace(stripped) == "" {
+@@ -15781,6 +15802,47 @@ func isHookBlockedResponse(text string) bool {
+ 		strings.HasPrefix(trimmed, "operation stopped by hook")
+ }
+ 
++// hookBlockACPPrefixRe matches the ACP-platform hook-block wrapper prefix.
++//
++// 2026-09-16 真机实测（CodeBuddy CLI 走 ACP，cc-connect 的 my-workbuddy 项目）：
++// 阻断提示词时 CLI 产生的是 "Operation stopped by hook: <reason>"；并且这段文本会被
++// **带到下一轮的回复前面**，与真实回复直接粘连：
++//
++//	Operation stopped by hook: NO_REPLY实验E 收到，状态干净：…
++//
++// 若只用 isHookBlockedResponse 判静默，整条会因前缀命中而被丢弃 —— 本该投递的回复被吞。
++// 故必须有下面这个"剥离"能力。
++var hookBlockACPPrefixRe = regexp.MustCompile(`(?i)^\s*operation stopped by hook\s*:\s*`)
++
++// hookBlockReasonRe matches the reason marker our own hook writes.
++//
++// 注意：只吃标记本身，**不能**"切到行尾"。实测粘连形态是
++// "Operation stopped by hook: NO_REPLY实验E 收到，…" —— reason 与真回复之间连空格都没有，
++// 切到行尾会把真回复一起吃掉。
++var hookBlockReasonRe = regexp.MustCompile(`(?i)^NO_REPLY`)
++
++// stripHookBlockWrapper 剥离跨轮携带的钩子阻断包装，返回剥离后的文本与是否命中。
++//
++// 只处理 ACP 形态（"Operation stopped by hook: <reason>"），且要求 reason 确认为
++// 本仓钩子的 NO_REPLY 标记。这样既修掉"包装吞掉真回复"，又不会把 Claude Code 的
++// 整段包装文本误当回复投递（那种形态整段都是包装，交给 isHookBlockedResponse 静默）。
++//
++// 边界情况：包装后不是 NO_REPLY（例如换了 reason 文案）→ 无法确定边界，返回未命中，
++// 退回到原有的"整条静默"行为。所以**改钩子的 reason 文案会让本修复失效** ——
++// core/hook_block_silence_test.go 里有用例钉死这一点。
++func stripHookBlockWrapper(text string) (string, bool) {
++	loc := hookBlockACPPrefixRe.FindStringIndex(text)
++	if loc == nil {
++		return text, false
++	}
++	rest := text[loc[1]:]
++	rl := hookBlockReasonRe.FindStringIndex(rest)
++	if rl == nil || rl[0] != 0 {
++		return text, false
++	}
++	return rest[rl[1]:], true
++}
++
+ // isSilentReply reports whether text is exactly a NO_REPLY marker.
+ func isSilentReply(text string) bool {
+ 	return silentReplyRe.MatchString(text)
+diff --git a/core/hook_block_silence_test.go b/core/hook_block_silence_test.go
+index 52c76e8..b438343 100644
+--- a/core/hook_block_silence_test.go
++++ b/core/hook_block_silence_test.go
+@@ -135,6 +135,11 @@ func TestProcessInteractiveEvents_HookBlockedNotDelivered(t *testing.T) {
+ 			name: "leading-newline",
+ 			text: "\n\nOperation stopped by hook: x",
+ 		},
++		{
++			// 2026-09-16 真机：ACP 平台纯阻断的真实文本（response_len=35 = 27+8）
++			name: "acp-pure-block-no-reply",
++			text: "Operation stopped by hook: NO_REPLY",
++		},
+ 	}
+ 
+ 	for _, tc := range cases {
+@@ -158,6 +163,94 @@ func TestProcessInteractiveEvents_NormalReplyStillDelivered(t *testing.T) {
+ 	}
+ }
+ 
++// TestStripHookBlockWrapper 钉死"剥离跨轮携带的阻断包装"的能力。
++//
++// 取证：2026-09-16 真机（cc-connect 的 my-workbuddy 项目 + CodeBuddy CLI 走 ACP）。
++// 连发两轮 —— 第一轮 @dsh 被钩子拦下；第二轮 @wb 本应正常回复，但会话历史里记的是：
++//
++//	[46] assistant | Operation stopped by hook: NO_REPLY实验E 收到，状态干净：…
++//
++// 即上一轮的包装文本与真实回复**直接粘连**（中间连空格都没有），整条因此命中前缀判定被静默。
++// 修复思路：把包装剥掉再看剩下什么，而不是一见前缀就整条静默。
++func TestStripHookBlockWrapper(t *testing.T) {
++	const claudeForm = "UserPromptSubmit operation blocked by hook:\nL2: …\n\nOriginal prompt: @dsh x"
++
++	cases := []struct {
++		name     string
++		text     string
++		wantRest string
++		wantHit  bool
++	}{
++		{
++			name:     "纯阻断包装 → 剥完为空（应静默）",
++			text:     "Operation stopped by hook: NO_REPLY",
++			wantRest: "",
++			wantHit:  true,
++		},
++		{
++			name:     "包装+真回复粘连 → 只剩真回复（应投递）",
++			text:     "Operation stopped by hook: NO_REPLY实验E 收到，状态干净：本条正常作答。",
++			wantRest: "实验E 收到，状态干净：本条正常作答。",
++			wantHit:  true,
++		},
++		{
++			name:     "带前导换行与空格",
++			text:     "\n\n  Operation stopped by hook: NO_REPLY真实回复",
++			wantRest: "真实回复",
++			wantHit:  true,
++		},
++		{
++			name:     "大小写不敏感",
++			text:     "OPERATION STOPPED BY HOOK: no_reply 真实回复",
++			wantRest: " 真实回复",
++			wantHit:  true,
++		},
++		{
++			// Claude Code 形态整段都是包装，边界不可知 → 不动它，交给 isHookBlockedResponse 静默
++			name:     "Claude Code 形态不剥离",
++			text:     claudeForm,
++			wantRest: claudeForm,
++			wantHit:  false,
++		},
++		{
++			// reason 换成别的文案就无法确定边界 → 退回"整条静默"。
++			// 这条用例的作用：一旦有人改了钩子的 reason 文案导致修复失效，测试会立刻报错。
++			name:     "reason 不是 NO_REPLY → 不剥离",
++			text:     "Operation stopped by hook: 换个文案真实回复",
++			wantRest: "Operation stopped by hook: 换个文案真实回复",
++			wantHit:  false,
++		},
++		{
++			name:     "普通回复不误伤",
++			text:     "已完成，三个 project 全部 platform ready。",
++			wantRest: "已完成，三个 project 全部 platform ready。",
++			wantHit:  false,
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			got, hit := stripHookBlockWrapper(tc.text)
++			if hit != tc.wantHit || got != tc.wantRest {
++				t.Fatalf("stripHookBlockWrapper(%q) = (%q, %v), want (%q, %v)",
++					tc.text, got, hit, tc.wantRest, tc.wantHit)
++			}
++		})
++	}
++}
++
++// TestProcessInteractiveEvents_StaleWrapperDoesNotEatReply 是本次修复的核心断言（真实引擎通路）：
++// "上一轮阻断包装 + 本轮真回复"的粘连体必须把真回复投递出去，而不是整条静默。
++//
++// 反证：修复前（先跑 isHookBlockedResponse）该用例会失败 —— 整条因前缀命中被静默，一条都发不出。
++func TestProcessInteractiveEvents_StaleWrapperDoesNotEatReply(t *testing.T) {
++	const real = "实验E 收到，状态干净：本条正常作答。"
++	sent := runHookBlockedDelivery(t, "stale-wrapper", "Operation stopped by hook: NO_REPLY"+real)
++	if len(sent) != 1 || sent[0] != real {
++		t.Fatalf("包装后粘连的真回复应被剥离并投递，实际发出 %#v", sent)
++	}
++}
++
+ // TestSilentReplySemanticsUnchanged 回归保护：新增钩子阻断判定不得改变原有
+ // NO_REPLY 静默语义（bare marker 静默 / 尾随 marker 剥离 / 非末尾不匹配）。
+ func TestSilentReplySemanticsUnchanged(t *testing.T) {

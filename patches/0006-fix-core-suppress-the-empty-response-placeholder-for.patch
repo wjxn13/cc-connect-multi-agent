@@ -1,0 +1,139 @@
+From d4e633fed88d58a74f7d150a21f2753ac6e2496f Mon Sep 17 00:00:00 2001
+From: wjxn13 <yqyj33@qq.com>
+Date: Wed, 16 Sep 2026 23:06:12 +0800
+Subject: [PATCH 6/6] fix(core): suppress the empty-response placeholder for
+ hook-blocked turns
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem
+-------
+The previous patch (f3d66d4) strips the hook-block wrapper text, but that
+only covers the case where the agent *does* emit text. When the pre-model
+hook rejects the turn, the agent emits nothing at all, so the engine falls
+through to the MsgEmptyResponse placeholder ("(空响应)" / "(empty
+response)"). That placeholder is not recognised by the silence check, so
+it gets delivered to the user.
+
+This is exactly what an ACP agent does on `{ kind: "reject" }`: the model
+never runs, so there is no text and no `assistant` event.
+
+Evidence (DSH + @deepseek-ai/dsh-hooks-claude-code)
+---------------------------------------------------
+* hook/result event:      {"decision":"block","exitCode":0}
+* request/header count:   0            (the model was never called)
+* turn/end reason:        {"kind":"blocked"}
+* cc-connect log (before): response_len=11, silent=false
+* cc-connect log (after):  msg="empty response suppressed" silent=true
+
+Note: cc-connect's ACP adapter does not parse the `blocked` stop reason.
+`grep -rE 'stopReason|blocked|refusal|turn/end' agent/acp` returns zero
+hits, so the engine cannot tell why the turn was empty. Therefore the
+check is deliberately on "no content at all" rather than on a hook signal.
+
+Why silence rather than deliver
+-------------------------------
+1. The placeholder carries zero information for the user; it only confuses.
+2. It is the *expected* by-product of the pre-model gating working well —
+   the more accurately we block, the more often it appears.
+3. A genuine agent failure still returns an error via the EventError
+   branch and is unaffected.
+4. It is still logged (`empty response suppressed`) for troubleshooting.
+
+Tests
+-----
+TestProcessInteractiveEvents_EmptyResponseNotDelivered asserts both
+directions: an empty turn must deliver nothing, while a turn with real
+content must still be delivered verbatim (guards against over-silencing).
+---
+ core/engine.go                  | 23 +++++++++++++++++++++++
+ core/hook_block_silence_test.go | 28 ++++++++++++++++++++++++++++
+ 2 files changed, 51 insertions(+)
+
+diff --git a/core/engine.go b/core/engine.go
+index ce99752..238cb9f 100644
+--- a/core/engine.go
++++ b/core/engine.go
+@@ -5003,8 +5003,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
+ 			} else if fullResponse == "" && len(textParts) > 0 {
+ 				fullResponse = strings.Join(textParts, "")
+ 			}
++			emptyResponse := false
+ 			if fullResponse == "" {
+ 				fullResponse = e.i18n.T(MsgEmptyResponse)
++				emptyResponse = true
+ 			}
+ 
+ 			// Strip any agent-self-reported "[ctx: ~XX%]" marker so it does not
+@@ -5062,6 +5064,27 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
+ 				}
+ 			}
+ 
++			if !isSilent && emptyResponse {
++				// 「agent 完全没输出」的回合不投递空响应占位符（2026-09-16 新增）。
++				//
++				// 触发场景：ACP agent 的前置拦截钩子以 { kind:"reject" } 结束回合 ——
++				// 模型没跑、agent 不产生任何文本 → 上面会落到空响应占位符
++				// （"(空响应)" / "(empty response)"）。
++				// 实测（DSH + dsh-hooks-claude-code）：hook/result 显示
++				// { decision:"block", exitCode:0 }，同轮 request/header 为 0 条
++				// （模型确实没被调用），turn/end 的 reason 是 { kind:"blocked" }。
++				// 但 cc-connect 的 ACP 适配器不解析 turn/end 的 blocked 状态，
++				// 所以这里只能按「无内容」判定。
++				//
++				// 为什么直接静默而不是投递：
++				//   ① 占位符对用户没有任何信息价值（只会让人困惑）；
++				//   ② 它恰恰是「点名制静默」正常工作时的必然产物 —— 拦得越准，越常出现；
++				//   ③ 真正的 agent 故障会走 EventError 分支（返回 error），不受此处影响；
++				//   ④ 仍在日志留痕，排查时可查。
++				isSilent = true
++				slog.Info("empty response suppressed", "session", sessionKey)
++			}
++
+ 			if !isSilent && (isSilentReply(baseResponse) || isHookBlockedResponse(baseResponse)) {
+ 				isSilent = true
+ 			}
+diff --git a/core/hook_block_silence_test.go b/core/hook_block_silence_test.go
+index b438343..e6a9e8f 100644
+--- a/core/hook_block_silence_test.go
++++ b/core/hook_block_silence_test.go
+@@ -1,6 +1,7 @@
+ package core
+ 
+ import (
++	"strings"
+ 	"testing"
+ 	"time"
+ )
+@@ -304,3 +305,30 @@ func TestHookBlockTextWasDeliveredBeforePatch(t *testing.T) {
+ 		t.Fatalf("这段文本应约 134 字节（真机 response_len=134），实际 %d", n)
+ 	}
+ }
++
++// TestProcessInteractiveEvents_EmptyResponseNotDelivered 钉住「agent 完全没输出」的回合不投递。
++//
++// 线上形态（2026-09-16 实测：DSH + @deepseek-ai/dsh-hooks-claude-code）：前置拦截钩子以
++// { kind:"reject" } 结束回合 —— 模型根本没跑（同轮 request/header 记录数为 0，
++// hook/result 记的是 { decision:"block", exitCode:0 }），agent 不产生任何文本，
++// 于是 engine 落到空响应占位符（英文 "(empty response)" / 中文 "(空响应)"）。
++//
++// 若不静默：用户会在微信收到一条毫无信息量的占位符 —— 而且**拦得越准、它出现得越频繁**
++// （它正是「点名制」正常工作时的必然产物），故必须按静默处理。
++// 真正的 agent 故障走 EventError 分支，不受此影响；静默时另有日志留痕。
++//
++// 反向对照：把 engine.go 里 `if !isSilent && emptyResponse` 那段删掉，本测试会失败
++// （平台会收到 "(empty response)"）。
++func TestProcessInteractiveEvents_EmptyResponseNotDelivered(t *testing.T) {
++	sent := runHookBlockedDelivery(t, "empty-response", "")
++	if len(sent) != 0 {
++		t.Fatalf("agent 无输出时不应投递任何消息，实际发出 %d 条: %q", len(sent), sent)
++	}
++
++	// 对照组：只要有真实内容，就必须照常投递 —— 确保上面的静默不是「把所有东西都吞了」。
++	real := "真实回复不应被吞"
++	got := runHookBlockedDelivery(t, "empty-response-control", real)
++	if len(got) != 1 || !strings.Contains(got[0], real) {
++		t.Fatalf("有内容时必须照常投递，实际发出 %d 条: %q", len(got), got)
++	}
++}

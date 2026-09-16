@@ -1,0 +1,8 @@
+# 补丁文件必须保持原始字节（LF）—— CRLF 会让 git am / git apply 失败。
+# 本仓库 core.autocrlf=true，若不显式排除，Windows 上克隆出来的 .patch 会变成 CRLF。
+*.patch -text
+
+# 钩子脚本同理：它是被 agent 直接执行的，不希望行尾被改写。
+hooks/*.js text eol=lf
+
+*.sh text eol=lf

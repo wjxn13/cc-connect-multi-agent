@@ -1,0 +1,62 @@
+From 4381d0910242b29950e69fdfc693220bc804664a Mon Sep 17 00:00:00 2001
+From: wjxn13 <yqyj33@qq.com>
+Date: Tue, 15 Sep 2026 21:13:16 +0800
+Subject: [PATCH 4/6] test(core): pin the necessity of the patch with real-run
+ evidence
+
+Adds TestHookBlockTextWasDeliveredBeforePatch, built from the block text
+observed in a live end-to-end run (cron-triggered my-project session with
+prompt '@dsh L2 e2e test'). That run logged:
+
+  turn complete ... response_len=134 input_tokens=0 output_tokens=0 silent=true
+  silent reply suppressed session=s1
+
+The test asserts the text is hit by isHookBlockedResponse, is NOT hit by
+the pre-existing NO_REPLY regex or by the trailing-marker stripper, and is
+around 134 bytes. Together that pins the premise: without this patch the
+text would have been delivered to the user as an ordinary successful
+reply, so the patch is not cosmetic.
+---
+ core/hook_block_silence_test.go | 32 ++++++++++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/core/hook_block_silence_test.go b/core/hook_block_silence_test.go
+index c016e06..52c76e8 100644
+--- a/core/hook_block_silence_test.go
++++ b/core/hook_block_silence_test.go
+@@ -179,3 +179,35 @@ func TestSilentReplySemanticsUnchanged(t *testing.T) {
+ 		t.Fatalf("尾随标记剥离行为异常: stripped=%q ok=%v", stripped, ok)
+ 	}
+ }
++
++// TestHookBlockTextWasDeliveredBeforePatch 把"补丁必要性"本身固化成断言。
++//
++// 这段文本取自 2026-09-15 的真机端到端实测（cron 触发 my-project，prompt 为
++// "@dsh L2 e2e test"）。同一轮 cc-connect 日志记的是：
++//
++//	turn complete ... response_len=134 input_tokens=0 output_tokens=0 silent=true
++//	silent reply suppressed session=s1
++//
++// 即：CLI 确实吐出了 134 字符的阻断文本，且引擎看见了它。若无本补丁，这段文本
++// 会走"正常成功回复（is_error=false）"那条路投递到用户微信 —— 这正是要修的问题。
++// 所以这里断言原版的两套机制都救不了它，只有 isHookBlockedResponse 能救。
++func TestHookBlockTextWasDeliveredBeforePatch(t *testing.T) {
++	const blockText = "UserPromptSubmit operation blocked by hook:\n" +
++		"L2: 这条消息点名了 @dsh，不由本 agent 应答\n\n" +
++		"Original prompt: @dsh L2 e2e test"
++
++	if !isHookBlockedResponse(blockText) {
++		t.Fatal("补丁判定未命中真机文本")
++	}
++	if isSilentReply(blockText) {
++		t.Fatal("原版 NO_REPLY 正则竟命中了它 —— 那么'必须打补丁'的前提不成立，需重新评估整件事")
++	}
++	if _, ok := stripTrailingSilent(blockText); ok {
++		t.Fatal("原版尾随标记剥离也不应命中")
++	}
++	// 真机日志记的是 response_len=134，数的是 UTF-8 字节。这里只做量级校验 ——
++	// 要点是"它是一段长文本"，绝不可能是 NO_REPLY 这种标记。
++	if n := len(blockText); n < 100 || n > 160 {
++		t.Fatalf("这段文本应约 134 字节（真机 response_len=134），实际 %d", n)
++	}
++}

@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "<NODE_EXE> <HOOK_JS> --agent dsh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

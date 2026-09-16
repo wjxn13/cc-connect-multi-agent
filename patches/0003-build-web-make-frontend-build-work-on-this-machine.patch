@@ -1,0 +1,30 @@
+From b5ce849d3b6498497652e2bced8cc87ef5427f10 Mon Sep 17 00:00:00 2001
+From: wjxn13 <yqyj33@qq.com>
+Date: Tue, 15 Sep 2026 21:01:46 +0800
+Subject: [PATCH 3/6] build(web): make frontend build work on this machine
+
+pnpm's default symlink linker does not work here: every dependency of
+vite ends up as an empty directory plus a .ignored_* marker, and vite
+then fails with 'Cannot find package .../picomatch/index.js'. Switch the
+workspace to nodeLinker: hoisted (flat node_modules, no symlinks) and
+approve esbuild's postinstall, which pnpm 10+ blocks by default with a
+'set this to true or false' placeholder.
+
+Note: tsc -b also fails here (cannot find @types/react under the pnpm
+layout); build with 'node node_modules/vite/bin/vite.js build' instead,
+which skips type-checking and still emits dist/.
+---
+ web/pnpm-workspace.yaml | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/web/pnpm-workspace.yaml b/web/pnpm-workspace.yaml
+index 0ef6ea0..26f6c74 100644
+--- a/web/pnpm-workspace.yaml
++++ b/web/pnpm-workspace.yaml
+@@ -1 +1,5 @@
+-onlyBuiltDependencies: esbuild
++nodeLinker: hoisted
++allowBuilds:
++  esbuild: true
++onlyBuiltDependencies:
++  - esbuild

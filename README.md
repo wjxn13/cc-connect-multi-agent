@@ -1,8 +1,13 @@
 # cc-connect-multi-agent
 
-把**多个不同的 AI agent** 接到**同一个微信入口**的完整实践记录 —— 含架构、配置、14 个探针脚本、以及一路踩过的坑。
+把**多个不同的 AI agent** 接到**同一个微信入口**的完整实践记录 —— 含架构、配置、探针脚本、
+一套**三平台通用的前置拦截钩子**、以及一路踩过的坑。
 
 > 这套东西跑在一台 Windows 11 笔记本上（Ryzen 7 6800H + RTX 3050 Ti）。目标很朴素：**不想为了跟不同 AI 说话而开不同的窗口**，就用微信当一个统一入口，背后挂三个 agent，各干各擅长的活。
+>
+> 三个 agent 共用一个微信入口，所以「一条消息其实三个人都收到」是默认行为。
+> 解决的路线是把判定**前移到模型调用之前**（见 `docs/06` 与 `hooks/`）——
+> 否则每跟一个 agent 说话，另外两个也要各烧一次完整 LLM 调用。
 
 ---
 
@@ -11,18 +16,25 @@
 ```mermaid
 graph TD
     U[微信用户] -->|官方 ilinkai 智能对话接口| B[cc-connect 桥接<br/>Go 单进程]
-    B -->|扇出：同一条消息投给每个 project| P1[my-project<br/>Claude Code]
-    B -->|扇出| P2[my-dsh<br/>DeepSeek Harness]
-    B -->|扇出| P3[my-workbuddy<br/>WorkBuddy / CodeBuddy CLI]
-    P1 <-.->|relay 跨项目拨号| P2
-    P2 <-.->|relay 跨项目拨号| P3
+    B -->|扇出：同一条消息投给每个 project| G1[L2 钩子<br/>my-project]
+    B -->|扇出| G2[L2 钩子<br/>my-dsh]
+    B -->|扇出| G3[L2 钩子<br/>my-workbuddy]
+    G1 -->|该我答| P1[Claude Code]
+    G2 -->|该我答| P2[DeepSeek Harness]
+    G3 -->|该我答| P3[WorkBuddy / CodeBuddy CLI]
+    G1 -.->|点名了别人| X[拦下<br/>0 次模型调用]
+    G2 -.->|点名了别人| X
+    G3 -.->|点名了别人| X
     P1 <--> M[(memorix<br/>跨 agent 共享记忆)]
     P2 <--> M
     P3 <--> M
+    P1 <-.->|relay 跨项目拨号| P2
+    P2 <-.->|relay| P3
 ```
 
 - **入口层**：微信（走腾讯官方 ilinkai 智能对话接口，非第三方协议，无封号风险）
 - **桥接层**：`cc-connect` —— 负责收消息、拉起 agent、把回复发回去
+- **前置拦截层**：三家各自的 `UserPromptSubmit` 钩子 —— 在模型被调用之前判定这条是不是给自己的
 - **agent 层**：Claude Code（原生支持）、DSH / WorkBuddy（都走标准 ACP 协议）
 - **协作层**：`relay`（agent 之间互相拨号）+ `memorix`（共享记忆与留言板）
 
@@ -42,11 +54,18 @@ msg_id=7505310717695579528 → 3 次 message received → 3 次 turn complete
 
 **cc-connect 没有「按内容 / 关键词 / @ 对象 选择投递给谁」的入站能力。**
 
-### 2. 「不该我答」是靠 agent 自己判、不是桥接拦
+### 2. 桥接不拦，但你可以在**模型调用之前**自己拦（本仓库已实现）
 
 `NO_REPLY` 这个字面量在 `cc-connect.exe` 里**搜不到** —— 它不是桥接的内置开关，而是**提示词约定**：agent 的规则文件（`CLAUDE.md` / `AGENTS.md`）要求它在「不该自己答」时整段只输出 `NO_REPLY`，桥接识别后把该次回复标记 `silent=true` 并不投递。
 
-代价是：**其他 agent 依然会跑完一次完整 LLM 调用**，只是不占微信消息位。
+**但这条路只在出口生效，代价是**：其他 agent 依然会跑完一次完整 LLM 调用。
+
+> ⚠️ **本条原是「做不到」的结论，现已解决** —— 见 `docs/06` 与 `hooks/`。
+> 三家 agent 各自支持 `UserPromptSubmit` 钩子，可以在**模型被调用之前**判定「这条不是给我的」
+> 并直接结束该轮。实测被拦轮次 **925 毫秒**（对比正常轮 5–15 秒），同轮**模型调用数为 0**。
+>
+> `NO_REPLY` 仍然保留，但角色从「唯一的静默手段」降级为「兜底」。
+> 这条路需要给 cc-connect 打两处小补丁（`patches/`），否则「无正文」的回合会漏内容给用户。
 
 ### 3. `banned_words` 无法用于按 project 定向拦截（实测失败）
 
@@ -72,6 +91,7 @@ msg_id=7505310717695579528 → 3 次 message received → 3 次 turn complete
 
 | 路线 | 做法 | 代价 |
 |---|---|---|
+| **L2 前置拦截（本仓库已落地）** | 三家各装 `UserPromptSubmit` 钩子，在模型调用前判定 | 要给 cc-connect 打两处补丁；每个 agent 一处配置 |
 | 独立 bot 身份 | 每个 agent 一个微信机器人 | 微信里多几个联系人 |
 | 自建聊天入口 | 用 cc-connect 的 management API 定向投递（`POST /api/v1/projects/{name}/send`） | 要开发 |
 | 单前台 + relay | 微信只挂一个 project 当前台，其余由它转发 | 延迟明显（relay 往返实测 46–51 秒） |
@@ -87,8 +107,11 @@ msg_id=7505310717695579528 → 3 次 message received → 3 次 turn complete
 | `docs/03-relay跨agent主动协作通道-实测报告.md` | relay（agent 互拨）的绑定机制、两个缺陷与补救 |
 | `docs/04-cc-connect微信桥接运维手册.md` | 运维手册：路径、配置格式坑、重启规程、排障命令 |
 | `docs/05-能力边界实测.md` | 上面「做不到什么」的完整证据链 |
+| `docs/06-L2前置拦截-三平台落地报告.md` | **把判定前移到模型调用之前**：三平台钩子、三个陷阱、引擎补丁、端到端证据 |
+| `hooks/` | 前置拦截钩子本体 + 两份平台配置样例（含「引号规则」的差异说明） |
+| `patches/` | 给 cc-connect 打的引擎侧补丁（6 个提交，含应用方法与上游现状） |
 | `config/config.example.toml` | 三 agent 接入的完整配置样例（已脱敏） |
-| `scripts/` | 14 个探针/诊断脚本（ACP 握手、权限、会话读取、记忆层验证） |
+| `scripts/` | 15 个脚本：探针/诊断（ACP 握手、权限、会话读取、记忆层验证）+ L2 钩子离线回归测试 |
 
 ---
 
@@ -116,6 +139,25 @@ python scripts/acp_probe.py "@claude，1+1 是多少"     # DSH / ACP agent
 python scripts/cbc_acp_probe.py                       # CodeBuddy / WorkBuddy 握手
 ```
 
+**验证前置拦截钩子**（离线，不启动任何 agent、不花 token）：
+
+```bash
+python scripts/l2_hook_tests.py    # 期望末行：结果：31/31 通过
+```
+
+---
+
+## 前置拦截（L2）怎么落地
+
+要让「点名了别的 agent」的消息**不进入模型**，需要两件事：
+
+1. **给每个 agent 装钩子** —— 见 `hooks/README.md`（三家的挂载方式与引号规则各不相同）
+2. **给 cc-connect 打补丁** —— 见 `patches/README.md`（否则「无正文」的回合会漏内容给用户）
+
+完整背景、实测报文与验证方法见 `docs/06-L2前置拦截-三平台落地报告.md`。
+
+> 没有第 2 步也能跑，但会出现两种症状：「微信收到 `(空响应)`」和「每拦一次、下一条消息就没回」。
+
 ---
 
 ## 踩坑清单
@@ -132,6 +174,11 @@ python scripts/cbc_acp_probe.py                       # CodeBuddy / WorkBuddy �
 | 部分回复发送失败，报 `sendMessage ret=-2` | 多个 project 共用同一个微信 bot，`context_token` 相互挤掉 | 减少共用该 token 的 project 数，或给不同 project 配独立 bot |
 | 某 agent 的规则文件明明改了却不生效 | resume 的旧会话不会重新加载 `CLAUDE.md` / `AGENTS.md` | 备份并移走 `sessions/*.json`，重启后新会话才吃到新规则 |
 | 改完措辞模型依然不听 | 温和措辞对模型约束力不足 | 改成**协议级硬规则**（禁止作答、禁止调用工具、完整回复必须恰好 N 个字符） |
+| 钩子「配好了」但完全没拦住 | DSH 在 Windows 上经 PowerShell 执行钩子，`exit 2`（官方定义的阻断码）会被改写成 `1` | 改用 **stdout JSON `{"decision":"block"}` + exit 0**。判据读 agent 侧会话的 `hook/result`，别信单行日志 |
+| 钩子执行报「表达式或语句中包含意外的标记」 | DSH 执行 hook 命令时不做 shell 引号转义 | **DSH 那份配置里不能写引号**（WorkBuddy 那份反而必须写，两者不能共用） |
+| 拦住了，但微信收到一条「(空响应)」 | agent 被拦时真·零输出，cc-connect 落到 `MsgEmptyResponse` 占位符 | 打 `patches/0006`（agent 无输出 → 静默）；ACP 适配器不解析 `turn/end` 的 `blocked` |
+| **每拦一次，我下一条消息就没回** | 阻断包装文本会被携带到下一轮、与真回复粘连；「整条静默」把真回复也吞了 | 打 `patches/0005`（改成**剥离包装、投递剩余真回复**） |
+| 某些消息莫名没被拦、模型照跑 | 消息带 `<system-reminder>` 注入块前缀，而点名正则是开头锚定（`^@xxx`） | 钩子里先剥**开头**的注入块；`l2-hook.jsonl` 里 `promptHead` ≠ `matchHead` 就是命中了这条 |
 
 ---
 
@@ -139,10 +186,32 @@ python scripts/cbc_acp_probe.py                       # CodeBuddy / WorkBuddy �
 
 - [cc-connect](https://github.com/chenhg5/cc-connect) —— 消息平台 ↔ 本地 AI agent 桥接（本方案的底座）
 - [memorix](https://github.com/AVIDS2/memorix) —— 跨 agent 本地优先共享记忆
+- `@deepseek-ai/dsh-hooks-claude-code` —— 让 DSH 能跑 Claude Code 格式的 `hooks.json`
+- Claude Code 与 WorkBuddy 各自内置的 `UserPromptSubmit` 钩子机制（前置拦截的基础）
 - 微信通道走腾讯 `ilinkai.weixin.qq.com` 官方智能对话接口
+
+---
+
+## 版本基线（重要）
+
+| 组件 | 本记录使用的版本 | 核对时（2026-09-16）的上游最新 |
+|---|---|---|
+| cc-connect | **v1.3.4**（+ `patches/` 里 6 个提交） | **v1.5.0**（2026-08-16），`main` 最新提交 2026-09-10 |
+| DSH 钩子插件 `@deepseek-ai/dsh-hooks-claude-code` | v0.1.5-rc.2 | —— |
+
+两件事要留意：
+
+1. **本机跑的桥接落后上游两个小版本。** `patches/` 里的补丁已验证对上游 `main` **仍能干净应用**
+   （6/6），所以升级时不必 rebase，但升级会**覆盖 `bin/cc-connect.exe`**、补丁需要重新编译部署。
+2. 上游 `main` 截至核对时**仍未**处理 hook-block 文本（`core/engine.go` 里 `MsgEmptyResponse`
+   仍是全仓唯一的无条件赋值），所以这些补丁**目前仍然必要**。
 
 ---
 
 ## 说明
 
 仓库内容为本机实测记录，含大量 Windows 绝对路径与进程排查细节，**已脱敏**（微信 open_id、bot token 均为占位符）。若要复现，请按 `config/config.example.toml` 中的注释逐项替换。
+
+`hooks/` 里的两个配置样例用 `<NODE_EXE>` / `<HOOK_JS>` 两个占位符代替了本机路径；
+`scripts/l2_hook_tests.py` 可用 `CC_L2_NODE` / `CC_L2_HOOK` 两个环境变量指定路径，默认会自己找同仓库的钩子。
+

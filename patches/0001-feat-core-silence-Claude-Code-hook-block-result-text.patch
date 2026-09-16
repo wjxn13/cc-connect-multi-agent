@@ -1,0 +1,159 @@
+From 1effa55612116f549e4215a35f86048a0e0d729f Mon Sep 17 00:00:00 2001
+From: wjxn13 <yqyj33@qq.com>
+Date: Tue, 15 Sep 2026 20:23:11 +0800
+Subject: [PATCH 1/6] feat(core): silence Claude Code hook-block result text
+
+When a UserPromptSubmit hook blocks a prompt, the CLI stops before the
+model is called and emits a result event whose `result` field is a
+wrapper string ("UserPromptSubmit operation blocked by hook: ..." /
+"Operation stopped by hook: ...") rather than model output. cc-connect
+treated it as a normal successful reply (is_error=false, num_turns=0) and
+delivered it to the chat, which showed up as noise in the WeChat bridge.
+
+Teach the silent-reply check to also recognise that wrapper, so such a
+turn stays silent. Prefix-anchored and whitespace-tolerant; a normal reply
+that merely mentions the phrase further in is not swallowed.
+
+Includes unit tests built from block texts captured on a real CLI run
+(Claude Code 2.1.270 + fake Anthropic API).
+---
+ core/engine.go                  | 15 +++++-
+ core/hook_block_silence_test.go | 96 +++++++++++++++++++++++++++++++++
+ 2 files changed, 110 insertions(+), 1 deletion(-)
+ create mode 100644 core/hook_block_silence_test.go
+
+diff --git a/core/engine.go b/core/engine.go
+index 578dd35..9629dd4 100644
+--- a/core/engine.go
++++ b/core/engine.go
+@@ -5044,7 +5044,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
+ 			session.AddHistory("assistant", baseResponse)
+ 			sessions.Save()
+ 
+-			isSilent := isSilentReply(baseResponse)
++			isSilent := isSilentReply(baseResponse) || isHookBlockedResponse(baseResponse)
+ 			if !isSilent {
+ 				if stripped, ok := stripTrailingSilent(baseResponse); ok {
+ 					if strings.TrimSpace(stripped) == "" {
+@@ -15768,6 +15768,19 @@ var silentReplyRe = regexp.MustCompile(`(?i)^\s*NO_REPLY\s*$`)
+ // still suppress the marker from the delivered text (mirroring OpenClaw's stripSilentToken).
+ var silentReplyTrailingRe = regexp.MustCompile(`(?i)(?:^|\s+|\*+)NO_REPLY\s*$`)
+ 
++// isHookBlockedResponse reports whether text is a Claude Code hook-block
++// wrapper. When a UserPromptSubmit hook blocks a prompt, the CLI stops before
++// the model is called and emits a result event whose `result` field is this
++// wrapper text instead of model output. Such a turn carries no reply at all,
++// so it must stay silent rather than be delivered to the chat as the agent's
++// answer. Prefix-anchored on purpose: a normal reply that merely mentions the
++// phrase further in must not be swallowed.
++func isHookBlockedResponse(text string) bool {
++	trimmed := strings.TrimSpace(strings.ToLower(text))
++	return strings.HasPrefix(trimmed, "userpromptsubmit operation blocked by hook") ||
++		strings.HasPrefix(trimmed, "operation stopped by hook")
++}
++
+ // isSilentReply reports whether text is exactly a NO_REPLY marker.
+ func isSilentReply(text string) bool {
+ 	return silentReplyRe.MatchString(text)
+diff --git a/core/hook_block_silence_test.go b/core/hook_block_silence_test.go
+new file mode 100644
+index 0000000..8700d9e
+--- /dev/null
++++ b/core/hook_block_silence_test.go
+@@ -0,0 +1,96 @@
++package core
++
++import "testing"
++
++// TestIsHookBlockedResponse 用现场取证到的真实阻断文本验证判定函数。
++//
++// 取证方式：本机 Claude Code 2.1.270 + UserPromptSubmit 钩子 + 假 Anthropic API，
++// 阻断生效时 result 事件里的 `result` 字段即为下表两段文本；该字段正是
++// engine.go 的 fullResponse/baseResponse 来源，也就是会被投递到聊天窗口的内容。
++// 取证时的旁证：num_turns=0、total_cost_usd=0、is_error=false —— 说明这轮既没花钱、
++// 也不会被当作错误处理，只会作为一条「成功回复」发给用户，因此必须静默。
++func TestIsHookBlockedResponse(t *testing.T) {
++	cases := []struct {
++		name string
++		text string
++		want bool
++	}{
++		{
++			name: "decision:block 的真实文本",
++			text: "UserPromptSubmit operation blocked by hook:\n" +
++				"L2: 该消息应路由给其他 agent\n\n" +
++				"Original prompt: @dsh 测试阻断",
++			want: true,
++		},
++		{
++			name: "continue:false 的真实文本",
++			text: "Operation stopped by hook: L2: 该消息应路由给其他 agent",
++			want: true,
++		},
++		{
++			name: "大小写不敏感",
++			text: "USERPROMPTSUBMIT OPERATION BLOCKED BY HOOK: whatever",
++			want: true,
++		},
++		{
++			name: "容忍前导空白与换行",
++			text: "\n   Operation stopped by hook: x  \n",
++			want: true,
++		},
++		{
++			name: "空回复不误判",
++			text: "",
++			want: false,
++		},
++		{
++			name: "纯空白不误判",
++			text: "   \n\t ",
++			want: false,
++		},
++		{
++			name: "正常回复中途提到该短语不得被吞",
++			text: "我刚看到 operation stopped by hook 这个字符串，说明钩子确实生效了。结论：答案是 42。",
++			want: false,
++		},
++		{
++			name: "普通成功回复不受影响",
++			text: "已完成，结果如下：三个 project 全部 platform ready。",
++			want: false,
++		},
++		{
++			name: "NO_REPLY 标记不归本函数管",
++			text: "NO_REPLY",
++			want: false,
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			if got := isHookBlockedResponse(tc.text); got != tc.want {
++				t.Fatalf("isHookBlockedResponse(%q) = %v, want %v", tc.text, got, tc.want)
++			}
++		})
++	}
++}
++
++// TestSilentReplySemanticsUnchanged 回归保护：新增钩子阻断判定不得改变原有
++// NO_REPLY 静默语义（bare marker 静默 / 尾随 marker 剥离 / 非末尾不匹配）。
++func TestSilentReplySemanticsUnchanged(t *testing.T) {
++	if !isSilentReply("NO_REPLY") {
++		t.Fatal("裸 NO_REPLY 应判定为静默")
++	}
++	if !isSilentReply("  no_reply  ") {
++		t.Fatal("带空白的 NO_REPLY 应判定为静默")
++	}
++	if isSilentReply("NO_REPLY 之后再说点别的") {
++		t.Fatal("NO_REPLY 不在末尾时不应判定为静默")
++	}
++	if isHookBlockedResponse("NO_REPLY") {
++		t.Fatal("NO_REPLY 不应被钩子阻断判定误捕获")
++	}
++
++	stripped, ok := stripTrailingSilent("先说明理由\nNO_REPLY")
++	if !ok || stripped != "先说明理由" {
++		t.Fatalf("尾随标记剥离行为异常: stripped=%q ok=%v", stripped, ok)
++	}
++}

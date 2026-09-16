@@ -1,0 +1,131 @@
+From b686e4d7f75c3e83446a636ab14921ea9632da60 Mon Sep 17 00:00:00 2001
+From: wjxn13 <yqyj33@qq.com>
+Date: Tue, 15 Sep 2026 20:27:09 +0800
+Subject: [PATCH 2/6] test(core): add engine-path and reverse-control coverage
+ for hook-block silence
+
+Adds three layers of coverage for the hook-block silence patch:
+
+1. TestIsHookBlockedResponse - unit table driven by block texts captured
+   from a real CLI run (Claude Code 2.1.270 + fake Anthropic API), plus
+   negative cases so a normal reply mentioning the phrase is not swallowed.
+2. TestProcessInteractiveEvents_HookBlockedNotDelivered - drives the real
+   engine path in plain (non-card) message mode, delivering only an
+   EventResult, which is the actual shape on the wire when a hook blocks:
+   the model never runs (num_turns=0), so there is no streaming EventText.
+3. TestProcessInteractiveEvents_NormalReplyStillDelivered - control that
+   proves the assertion above is meaningful and that silence is not
+   applied too broadly.
+
+Also documents why rich-card mode must not be used for this check: with
+only a result event and no streamed text the engine emits nothing either
+way, so the test passes with or without the patch (verified by removing
+the patch call and re-running).
+---
+ core/hook_block_silence_test.go | 87 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 86 insertions(+), 1 deletion(-)
+
+diff --git a/core/hook_block_silence_test.go b/core/hook_block_silence_test.go
+index 8700d9e..c016e06 100644
+--- a/core/hook_block_silence_test.go
++++ b/core/hook_block_silence_test.go
+@@ -1,6 +1,9 @@
+ package core
+ 
+-import "testing"
++import (
++	"testing"
++	"time"
++)
+ 
+ // TestIsHookBlockedResponse 用现场取证到的真实阻断文本验证判定函数。
+ //
+@@ -73,6 +76,88 @@ func TestIsHookBlockedResponse(t *testing.T) {
+ 	}
+ }
+ 
++// runHookBlockedDelivery 用普通消息模式（非富文本卡片）跑一次真实引擎通路，
++// 只投递 EventResult —— 这正是钩子阻断时链路上的唯一回复事件（模型未运行，
++// num_turns=0，没有 assistant 事件，也就不存在流式 EventText 分片）。
++// 返回平台实际发出的消息列表。
++func runHookBlockedDelivery(t *testing.T, name, text string) []string {
++	t.Helper()
++	p := &stubPlatformEngine{n: "telegram"}
++	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
++	e.SetDisplayConfig(DisplayCfg{
++		ThinkingMessages: true,
++		ThinkingMaxLen:   300,
++		ToolMaxLen:       500,
++		ToolMessages:     true,
++	})
++
++	sessionKey := "telegram:user-hookblock-" + name
++	session := e.sessions.GetOrCreateActive(sessionKey)
++	agentSession := newControllableSession("s-hookblock-" + name)
++	state := &interactiveState{
++		agentSession: agentSession,
++		platform:     p,
++		replyCtx:     "ctx-hookblock-" + name,
++	}
++	e.interactiveStates[sessionKey] = state
++
++	agentSession.events <- Event{Type: EventResult, Content: text, Done: true}
++	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-hookblock-"+name, time.Now(), nil, nil, state.replyCtx)
++	return p.getSent()
++}
++
++// TestProcessInteractiveEvents_HookBlockedNotDelivered 把补丁放到真实引擎通路上验证：
++// 钩子阻断产生的 result 文本不得被投递到聊天窗口。
++//
++// 与 NO_REPLY 场景的差别：NO_REPLY 时模型正常运行并吐出了那几个字，所以链路上先有
++// EventText 分片；钩子阻断时模型根本没跑，链路上只有 EventResult。因此这里只发
++// EventResult —— 这才是线上真实形态。
++//
++// 注意：不要改用 rich card 模式来测这件事。已实测：rich card 模式下"只有 result、
++// 没有流式文本"时引擎本来就不落地任何消息，撤掉本补丁也照样通过，是没有判别力的
++// 假阳性（撤掉判定后仍 PASS 即其证据）。
++func TestProcessInteractiveEvents_HookBlockedNotDelivered(t *testing.T) {
++	cases := []struct {
++		name string
++		text string
++	}{
++		{
++			name: "decision-block",
++			text: "UserPromptSubmit operation blocked by hook:\n" +
++				"L2: 该消息应路由给其他 agent\n\n" +
++				"Original prompt: @dsh 测试阻断",
++		},
++		{
++			name: "continue-false",
++			text: "Operation stopped by hook: L2: 该消息应路由给其他 agent",
++		},
++		{
++			name: "leading-newline",
++			text: "\n\nOperation stopped by hook: x",
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			sent := runHookBlockedDelivery(t, tc.name, tc.text)
++			if len(sent) != 0 {
++				t.Fatalf("钩子阻断文本不应投递到聊天，实际发出 %d 条: %#v", len(sent), sent)
++			}
++		})
++	}
++}
++
++// TestProcessInteractiveEvents_NormalReplyStillDelivered 反向对照：同一条普通模式
++// 通路上，普通回复必须照常投递。既证明上一条测试的判据有效（不静默时确实会发出去），
++// 也防止静默做过头把正常回复吞掉。
++func TestProcessInteractiveEvents_NormalReplyStillDelivered(t *testing.T) {
++	const normal = "三个 project 全部 platform ready。"
++	sent := runHookBlockedDelivery(t, "normal", normal)
++	if len(sent) != 1 || sent[0] != normal {
++		t.Fatalf("普通回复应原样投递，实际发出 %#v", sent)
++	}
++}
++
+ // TestSilentReplySemanticsUnchanged 回归保护：新增钩子阻断判定不得改变原有
+ // NO_REPLY 静默语义（bare marker 静默 / 尾随 marker 剥离 / 非末尾不匹配）。
+ func TestSilentReplySemanticsUnchanged(t *testing.T) {
