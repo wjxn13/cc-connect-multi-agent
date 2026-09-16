@@ -40,6 +40,60 @@ graph TD
 
 ---
 
+## memorix（跨 agent 共享记忆层）—— **本项目依赖它才能闭环**
+
+架构图里那个 `M` 就是 [memorix](https://github.com/AVIDS2/memorix)：一个**本地优先**的
+跨 agent 共享记忆 / 协调层。它**不是可选装饰** —— 本方案里「agent 之间能互相留话、
+能知道谁被点名了」这件事全建立在它上面。
+
+### 它在这里承担三件事
+
+| 用途 | 说明 |
+|---|---|
+| **共享记忆** | 三个 agent 共用一份长期记忆（决策、约定、踩过的坑），换个 agent 接着干不用重讲一遍 |
+| **留言板 / 收件箱** | agent 之间、人和 agent 之间互相留言（`team_message`）。「人机共聊」的消息就存在这里 |
+| **协调身份** | 每个 agent 在 memorix 里有一个队籍（UUID）—— 消息的**发件人归属**靠它，不靠环境变量 |
+
+### 本仓库里与它相关的部分
+
+| 位置 | 作用 |
+|---|---|
+| 架构图的 `P1/P2/P3 <--> M` | 三个 agent 各自挂同一个 memorix |
+| `config/config.example.toml` | `my-workbuddy` 项目通过 `--mcp-config` 挂载 memorix MCP（其余两个 agent 在各自客户端的配置里挂） |
+| `docs/02-memorix共聊0.2规约与成败点验证报告.md` | 「人机共聊」可行性的完整验证 |
+| `scripts/memorix_probe.py` | 探针：档位对比 + 各端可见性检查 |
+| `scripts/memorix_team_probe.py` | 探针：`join` / `broadcast` / `poll` 的真调验证 |
+| `scripts/memorix_session_probe.py` | 探针：会话与身份绑定行为 |
+| 各 agent 的规则文件（`CLAUDE.md` / `AGENTS.md`） | 写入**协作规约**：该它作答时，先查收件箱再干活 |
+
+> 配套的人机界面在姊妹仓库 [memorix-chat](https://github.com/wjxn13/memorix-chat) ——
+> 一个本地聊天页，让人像用微信一样直接和这三个 agent 对话。
+
+### 配置要点（全是实测踩出来的）
+
+1. **档位必须选 `team`。** `lite` 档的官方定义是「20 tools, without team tools」——
+   **不含协调工具**：`memorix_poll` / `team_message` / `team_manage` / `team_task` 等 8 个
+   在 lite 档里**根本不存在**，「让 agent 主动看留言」物理上做不到。
+2. **四处配置都要改**：`~/.claude.json`、`~/.workbuddy/mcp.json`、`~/.dsh/cordis.patch.yml`、
+   `~/.cc-connect/config.toml`（即 `my-workbuddy` 的 `--mcp-config` 那一串 JSON）。
+3. **身份绑定只用 `team_manage action=join`。** 别用 `session_start` 的 `joinTeam` ——
+   后者是单 agent 语义，会把同一项目下其他 agent 在**同毫秒**置为 `left_at`（实测）。
+4. **CLI 是「一机一身份」。** 所以 agent **不能用 CLI 回消息**（会被记成"自己发给自己"），
+   回复必须走 MCP 的 `team_message`。也别指望用环境变量传身份 —— 不成立。
+5. **必须留一条 CLI 兜底。** memorix 的 MCP 冷启动要建索引（几秒到十几秒），
+   **第一次 LLM 请求时工具表里 0 个 memorix 工具**（实测：39 个工具 / 0 个 memorix；
+   第二轮 67 个 / 28 个）。所以「只靠 MCP 才 poll」的规约**注定失败**：
+
+   ```bash
+   node <memorix>/dist/cli/index.js message inbox --mark-read --cwd <共享目录>
+   ```
+6. **共享目录别在 `$HOME` 下建真实目录**，会报 `Refusing to bind $HOME as a project root`；
+   放在 `D:/memorix-shared` 这类独立目录里。
+
+> ⚠️ `status` 返回的是「当前有活跃会话」，**不是可用性** —— 别拿它判断 memorix 活没活。
+
+---
+
 ## 先说清楚：它做不到什么
 
 这部分比「能做什么」更重要。下面每条都是**实测**结论，不是推测。
@@ -111,13 +165,18 @@ msg_id=7505310717695579528 → 3 次 message received → 3 次 turn complete
 | `hooks/` | 前置拦截钩子本体 + 两份平台配置样例（含「引号规则」的差异说明） |
 | `patches/` | 给 cc-connect 打的引擎侧补丁（6 个提交，含应用方法与上游现状） |
 | `config/config.example.toml` | 三 agent 接入的完整配置样例（已脱敏） |
-| `scripts/` | 15 个脚本：探针/诊断（ACP 握手、权限、会话读取、记忆层验证）+ L2 钩子离线回归测试 |
+| `scripts/` | 14 个脚本：探针/诊断（ACP 握手、权限、会话读取）+ 3 个 memorix 记忆层验证 + L2 钩子离线回归测试 |
 
 ---
 
 ## 快速开始
 
 ```bash
+# 0. 装 memorix（跨 agent 共享记忆层 —— 见上一节，本方案依赖它）
+npm i -g memorix                    # 本机用的是 v1.9.2，bin 名同为 memorix
+# 装完必须确认档位是 team：lite 档没有协调工具，agent 主动看留言做不到
+# 四处都要挂上：~/.claude.json · ~/.workbuddy/mcp.json · ~/.dsh/cordis.patch.yml · ~/.cc-connect/config.toml
+
 # 1. 装 cc-connect
 npm i -g cc-connect
 
@@ -131,6 +190,10 @@ python -c "import tomllib;tomllib.load(open(r'$HOME/.cc-connect/config.toml','rb
 cc-connect daemon start
 # 日志确认：config loaded → 每个 project 的 platform ready → cc-connect is running projects=N
 ```
+
+> **不装 memorix 会怎样**：微信入口、三个 agent、L2 前置拦截**都照常工作**；
+> 但 agent 之间无法互相留话，「人机共聊」界面（`memorix-chat`）也没有数据源。
+> 换句话说：**通道能通，协作层缺席。**
 
 **验证通道是否真的通了**（不依赖微信，直接走 ACP 协议）：
 
@@ -185,7 +248,8 @@ python scripts/l2_hook_tests.py    # 期望末行：结果：31/31 通过
 ## 依赖与致谢
 
 - [cc-connect](https://github.com/chenhg5/cc-connect) —— 消息平台 ↔ 本地 AI agent 桥接（本方案的底座）
-- [memorix](https://github.com/AVIDS2/memorix) —— 跨 agent 本地优先共享记忆
+- [memorix](https://github.com/AVIDS2/memorix)（[mem.rglens.com](https://mem.rglens.com)）—— 跨 agent 本地优先共享记忆 / 协调层（**本方案依赖它**，见上方专节）
+- [memorix-chat](https://github.com/wjxn13/memorix-chat) —— 本项目配套的本地聊天页（人机界面）
 - `@deepseek-ai/dsh-hooks-claude-code` —— 让 DSH 能跑 Claude Code 格式的 `hooks.json`
 - Claude Code 与 WorkBuddy 各自内置的 `UserPromptSubmit` 钩子机制（前置拦截的基础）
 - 微信通道走腾讯 `ilinkai.weixin.qq.com` 官方智能对话接口
