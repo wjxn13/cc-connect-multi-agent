@@ -6,16 +6,22 @@ from collections import Counter
 # 期望：只出现 agent_message_chunk（内容恰好 NO_REPLY），不出现 agent_thought_chunk。
 PROMPT = sys.argv[1] if len(sys.argv) > 1 else "@claude，你好"
 
-NODE = r"C:/Users/<USER>/.workbuddy/binaries/node/versions/22.22.2-2/node.exe"
+# 路径不写死用户名：默认取当前用户的家目录（本机解析结果与写死时完全一致），
+# 换机器时用环境变量 CC_HOME / CC_NODE / CC_FILTER 覆盖即可。
+HOME = (os.environ.get("CC_HOME") or os.path.expanduser("~")).replace("\\", "/")
+
+NODE = os.environ.get("CC_NODE") or HOME + "/.workbuddy/binaries/node/versions/22.22.2-2/node.exe"
 DSH = r"D:/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js"
-FILTER = r"C:/Users/<USER>/.workbuddy/skills/cc-connect-weixin-bridge/scripts/acp-thought-filter.js"
+# 默认用同目录下的那份过滤器（本仓库自带），不依赖某个用户的 skills 目录。
+FILTER = os.environ.get("CC_FILTER") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "acp-thought-filter.js")
 
 env = dict(os.environ)
 env["ACP_FILTER_LOG"] = "1"   # 让代理把丢弃记录打到 stderr
 
 p = subprocess.Popen(
     [NODE, FILTER, NODE, DSH, "--profile", "acp"],
-    cwd=r"C:/Users/<USER>",
+    cwd=HOME,
     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     text=True, encoding="utf-8", errors="replace", bufsize=1, env=env,
 )
@@ -102,7 +108,7 @@ send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
       "params": {"protocolVersion": 1, "clientCapabilities": {}}})
 time.sleep(2)
 send({"jsonrpc": "2.0", "id": 2, "method": "session/new",
-      "params": {"cwd": "C:/Users/<USER>", "mcpServers": []}})
+      "params": {"cwd": HOME, "mcpServers": []}})
 
 sid = None
 for _ in range(30):

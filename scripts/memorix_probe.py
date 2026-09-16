@@ -19,12 +19,16 @@ memorix MCP 探针（stdio / newline-delimited JSON-RPC）
 """
 
 import json
+import os
 import subprocess
 import sys
 import threading
 import time
 
-NODE = r"C:/Users/<USER>/.workbuddy/binaries/node/versions/22.22.2-2/node.exe"
+# 路径不写死用户名：默认取当前用户的家目录（本机解析结果与写死时完全一致），
+# 换机器时用环境变量 CC_HOME / CC_NODE 覆盖即可。
+HOME = (os.environ.get("CC_HOME") or os.path.expanduser("~")).replace("\\", "/")
+NODE = os.environ.get("CC_NODE") or HOME + "/.workbuddy/binaries/node/versions/22.22.2-2/node.exe"
 CLI = r"D:/npm-global/node_modules/memorix/dist/cli/index.js"
 CWD = r"D:/memorix-shared"
 

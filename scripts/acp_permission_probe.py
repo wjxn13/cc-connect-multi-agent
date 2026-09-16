@@ -21,16 +21,21 @@ ACP 权限请求探针 —— 判断某个 ACP agent 在调用工具时会不会
 """
 
 import json
+import os
 import subprocess
 import sys
 import threading
 import time
 
-NODE = r"C:/Users/<USER>/.workbuddy/binaries/node/versions/22.22.2-2/node.exe"
+# 路径不写死用户名：默认取当前用户的家目录（本机解析结果与写死时完全一致），
+# 换机器时用环境变量 CC_HOME / CC_NODE 覆盖即可。
+HOME = (os.environ.get("CC_HOME") or os.path.expanduser("~")).replace("\\", "/")
+
+NODE = os.environ.get("CC_NODE") or HOME + "/.workbuddy/binaries/node/versions/22.22.2-2/node.exe"
 DSH = r"D:/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js"
 CODEBUDDY = r"D:/workbudy/WorkBuddy/resources/app.asar.unpacked/cli/bin/codebuddy"
-CWD_DSH = r"C:/Users/<USER>"
-CWD_CB = r"C:/Users/<USER>/wb-agent"
+CWD_DSH = HOME
+CWD_CB = HOME + "/wb-agent"
 
 
 def main():

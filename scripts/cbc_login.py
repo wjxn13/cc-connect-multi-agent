@@ -17,11 +17,15 @@ CodeBuddy / WorkBuddy 独立 CLI 登录器（带日志，便于排障）
 """
 import subprocess, json, threading, time, os, sys, webbrowser
 
-NODE = r"C:/Users/<USER>/.workbuddy/binaries/node/versions/22.22.2-2/node.exe"
+# 路径不写死用户名：默认取当前用户的家目录（本机解析结果与写死时完全一致），
+# 换机器时用环境变量 CC_HOME 覆盖即可。
+HOME = (os.environ.get("CC_HOME") or os.path.expanduser("~")).replace("\\", "/")
+
+NODE = os.environ.get("CC_NODE") or HOME + "/.workbuddy/binaries/node/versions/22.22.2-2/node.exe"
 # 默认用 WorkBuddy 内嵌版 CLI：它对应 www.workbuddy.cn 账号体系
 DEFAULT_CBC = r"D:/workbudy/WorkBuddy/resources/app.asar.unpacked/cli/bin/codebuddy"
 CBC = os.environ.get("CBC_CLI") or DEFAULT_CBC
-CONFIG_DIR = os.environ.get("CBC_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".codebuddy")
+CONFIG_DIR = os.environ.get("CBC_CONFIG_DIR") or os.path.join(HOME, ".codebuddy")
 METHOD = os.environ.get("CBC_AUTH_METHOD", "internal")
 WAIT_SECONDS = int(os.environ.get("CBC_WAIT_SECONDS", "900"))
 LOG_PATH = os.path.join(CONFIG_DIR, "login.log")

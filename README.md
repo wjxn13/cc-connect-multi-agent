@@ -208,10 +208,18 @@ python scripts/l2_hook_tests.py    # 期望末行：结果：31/31 通过
 
 ---
 
-## 说明
+## 说明（脱敏与复现）
 
-仓库内容为本机实测记录，含大量 Windows 绝对路径与进程排查细节，**已脱敏**（微信 open_id、bot token 均为占位符）。若要复现，请按 `config/config.example.toml` 中的注释逐项替换。
+仓库内容为本机实测记录，**已脱敏**。占位符与替换机制如下：
 
-`hooks/` 里的两个配置样例用 `<NODE_EXE>` / `<HOOK_JS>` 两个占位符代替了本机路径；
-`scripts/l2_hook_tests.py` 可用 `CC_L2_NODE` / `CC_L2_HOOK` 两个环境变量指定路径，默认会自己找同仓库的钩子。
+| 占位符 / 机制 | 说明 |
+|---|---|
+| `<USER>` | Windows 用户名。出现在 `docs/` 的路径示例与表格中，复现时替换成你自己的用户名 |
+| `<YOUR_OPENID>@im.wechat` | 微信 open_id，见 `config/config.example.toml` |
+| `<NODE_EXE>` / `<HOOK_JS>` | `hooks/` 里两份配置样例中的绝对路径 |
+| `CC_HOME` / `CC_NODE` / `CC_FILTER` | `scripts/` 下的脚本**不写死用户名**：默认用当前用户的家目录（本机解析结果与写死时逐字相同，零配置即可跑），换机器时用这几个环境变量覆盖 |
+| `CC_L2_NODE` / `CC_L2_HOOK` | `scripts/l2_hook_tests.py` 覆盖 node 与钩子脚本路径；默认自动使用本仓库 `hooks/` 下的那份 |
+
+**未脱敏的是软件安装路径**（如 `D:/dsh`、`D:/npm-global`、`D:/workbudy`）—— 它们不含个人信息，
+且是脚本能跑起来所必需的。若你的安装位置不同，按 `config/config.example.toml` 里的注释逐项替换即可。
 

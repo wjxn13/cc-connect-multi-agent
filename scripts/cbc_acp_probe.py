@@ -11,7 +11,11 @@ import subprocess, json, threading, time, sys, os
 #   正确顺序：initialize → authenticate(等响应) → session/new → session/prompt
 PROMPT = sys.argv[1] if len(sys.argv) > 1 else "只回复两个字：可用"
 
-NODE = r"C:/Users/<USER>/.workbuddy/binaries/node/versions/22.22.2-2/node.exe"
+# 路径不写死用户名：默认取当前用户的家目录（本机解析结果与写死时完全一致），
+# 换机器时用环境变量 CC_HOME / CC_NODE 覆盖即可。
+HOME = (os.environ.get("CC_HOME") or os.path.expanduser("~")).replace("\\", "/")
+
+NODE = os.environ.get("CC_NODE") or HOME + "/.workbuddy/binaries/node/versions/22.22.2-2/node.exe"
 # 默认用 WorkBuddy 内嵌版（连 www.workbuddy.cn 账号体系）；可用 CBC_CLI 覆盖。
 CBC = os.environ.get("CBC_CLI") or r"D:/workbudy/WorkBuddy/resources/app.asar.unpacked/cli/bin/codebuddy"
 METHOD = os.environ.get("CBC_AUTH_METHOD", "internal")

@@ -1,5 +1,9 @@
-import subprocess, json, threading, time, sys
+import subprocess, json, threading, time, sys, os
 from collections import Counter
+
+# 路径不写死用户名：默认取当前用户的家目录（本机解析结果与写死时完全一致），
+# 换机器时用环境变量 CC_HOME / CC_NODE 覆盖即可。
+HOME = (os.environ.get("CC_HOME") or os.path.expanduser("~")).replace("\\", "/")
 
 # 用法：D:/python/python.exe acp_dump.py "@claude，你好"
 # 作用：以真实 ACP 协议握手 DSH，把 agent 发出的【所有 session/update 类型】原样打印，
@@ -8,12 +12,12 @@ from collections import Counter
 #         - agent_message_chunk  → 与正文同类型（cc-connect 无法区分，必须从 agent 侧解决）
 PROMPT = sys.argv[1] if len(sys.argv) > 1 else "@claude，你好"
 
-NODE = r"C:/Users/<USER>/.workbuddy/binaries/node/versions/22.22.2-2/node.exe"
+NODE = os.environ.get("CC_NODE") or HOME + "/.workbuddy/binaries/node/versions/22.22.2-2/node.exe"
 DSH = r"D:/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js"
 
 p = subprocess.Popen(
     [NODE, DSH, "--profile", "acp"],
-    cwd=r"C:/Users/<USER>",
+    cwd=HOME,
     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     text=True, encoding="utf-8", errors="replace", bufsize=1,
 )
@@ -53,7 +57,7 @@ send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
 time.sleep(2)
 
 send({"jsonrpc": "2.0", "id": 2, "method": "session/new",
-      "params": {"cwd": "C:/Users/<USER>", "mcpServers": []}})
+      "params": {"cwd": HOME, "mcpServers": []}})
 
 sid = None
 for _ in range(30):

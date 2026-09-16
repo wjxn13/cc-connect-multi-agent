@@ -1,13 +1,17 @@
-import subprocess, json, threading, time, sys
+import subprocess, json, threading, time, sys, os
 
 # 用法：D:/python/python.exe acp_probe.py "@claude，1+1是多少"
 # 作用：以真实 ACP 协议握手 DSH，发一条 prompt，收集 agent_message_chunk 输出。
 # 用途：本地验证点名制（@claude 应输出恰好 NO_REPLY）与推理泄漏是否已消除。
 PROMPT = sys.argv[1] if len(sys.argv) > 1 else "@claude，1+1是多少"
 
-NODE = r"C:/Users/<USER>/.workbuddy/binaries/node/versions/22.22.2-2/node.exe"
+# 路径不写死用户名：默认取当前用户的家目录（本机解析结果与写死时完全一致），
+# 换机器时用环境变量 CC_HOME / CC_NODE 覆盖即可。
+HOME = (os.environ.get("CC_HOME") or os.path.expanduser("~")).replace("\\", "/")
+
+NODE = os.environ.get("CC_NODE") or HOME + "/.workbuddy/binaries/node/versions/22.22.2-2/node.exe"
 DSH  = r"D:/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js"
-p = subprocess.Popen([NODE, DSH, "--profile", "acp"], cwd=r"C:/Users/<USER>",
+p = subprocess.Popen([NODE, DSH, "--profile", "acp"], cwd=HOME,
                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                      text=True, encoding="utf-8", errors="replace", bufsize=1)
 
@@ -41,7 +45,7 @@ for attempt in range(20):
             sid = m["result"].get("sessionId") or m["result"].get("session_id")
     if sid: break
     if attempt == 0:
-        send({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"C:/Users/<USER>","mcpServers":[]}})
+        send({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":HOME,"mcpServers":[]}})
     time.sleep(1)
 print("SESSION:", sid)
 if sid:
