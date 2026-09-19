@@ -1,0 +1,1319 @@
+From 88b27e248e35c5d34128a55b5427bdb35138015c Mon Sep 17 00:00:00 2001
+From: wjxn13 <236573882+wjxn13@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 23:01:04 +0800
+Subject: [PATCH 7/8] feat(core): add cross-agent mention gate, agent labels
+ and sticky media routing
+
+Problem
+-------
+The platform fans every inbound message out to *all* projects. With three
+agents (Claude Code / DeepSeek Harness / WorkBuddy) behind one Weixin entry, a
+message meant for one agent is also injected into the other two: each injection
+is a full model call, so "@dsh do X" spends three agents' worth of quota, and
+the two agents that were not addressed tend to answer anyway -- from inside the
+agent there is no reliable signal that the message was not for it.
+
+Media makes it worse. Weixin cannot carry text and a photo in one message, so
+"@dsh" followed by a photo always arrives as two messages. The photo alone
+contains no mention token, so it lands on whichever project owns the platform
+default. Measured on this machine (2026-09-19):
+
+  * the photo preview screen has no text box at all;
+  * quoting a photo + typing text delivers the text but drops the photo;
+  * quoting text + sending a photo delivers the photo but drops the quote.
+
+So no client-side workaround can produce a single message that both names an
+agent and carries the image.
+
+Solution
+--------
+Put an addressing gate inside the engine, ahead of the agent session.
+
+* config: `[[mention_agents]]` declares each project's `aliases`, an optional
+  `default` ("answer" / "silent"), and a `media_default` owner. New
+  `agent_label` (global, under [display]) and `label` (per project) control the
+  outbound identity prefix. `NormalizeMentionAlias` folds case, whitespace and
+  a leading `@`, so "@DSH", " @dsh " and "dsh" are the same token.
+  `validateMentionAgents` rejects a missing or unknown project, a project
+  declared twice, one alias claimed by two projects, an entry with no usable
+  alias, and a `default` other than answer/silent.
+
+* engine: `mentionGateBlocked` reads the first @token in the message. Naming a
+  peer project drops the message right there -- no session, no agent process,
+  no tokens. Naming self, or naming nobody, passes through.
+
+* engine: an unaddressed message still refreshes a short-lived sticky addressee
+  (`mention_sticky.go`, TTL 3 min), so a photo sent right after "@dsh" routes to
+  dsh instead of the platform default. Sticky state is consulted only for
+  messages that carry no text, and it is consumed by the media router rather
+  than by the gate, so it cannot reshape text routing. The TTL is short on
+  purpose: long enough to cover "type the alias, then pick a photo", short
+  enough that someone who walked away does not silently route a much later
+  photo to a project they forgot they addressed.
+
+* webhook: `executePrompt` runs the same gate first. A webhook injects a
+  synthetic message straight into the processing loop and would otherwise
+  bypass the check that `handleMessage` performs.
+
+* ui: `stampAgentLabel` prepends the project's label at the engine's two send
+  choke points, so a reply, an error or a queue notice is attributable when
+  several projects share one account. The queued-message notice now also states
+  the queue position, which agent is holding the session and which one will run
+  it, plus how to redirect the message to a peer instead of waiting
+  (`MsgMessageQueuedDetail`, `MsgMessageQueuedReroute`); the session-start
+  failure notice names the project that failed and offers the recovery path
+  (`MsgFailedToStartSessionWhom`). All three keys ship in the five languages the
+  rest of the file carries.
+
+Evidence
+--------
+Live three-agent bridge, 2026-09-19 22:03, after "@dsh" followed by a photo:
+
+  mention gate: media message kept    project=my-dsh        owner=my-dsh
+  mention gate: media message dropped project=my-workbuddy token=(media)
+  mention gate: media message dropped project=my-project   token=(media)
+
+Text messages in the same batch routed normally, i.e. the sticky addressee did
+not leak into text. Compiles clean (`go build ./core/ ./config/ ./cmd/cc-connect/`).
+---
+ cmd/cc-connect/main.go | 114 +++++++++
+ config/config.go       | 192 +++++++++++++++
+ core/engine.go         | 535 ++++++++++++++++++++++++++++++++++++++++-
+ core/i18n.go           |  33 +++
+ core/mention_sticky.go | 107 +++++++++
+ core/webhook.go        |   8 +
+ 6 files changed, 984 insertions(+), 5 deletions(-)
+ create mode 100644 core/mention_sticky.go
+
+diff --git a/cmd/cc-connect/main.go b/cmd/cc-connect/main.go
+index 9987ea7..846a8e8 100644
+--- a/cmd/cc-connect/main.go
++++ b/cmd/cc-connect/main.go
+@@ -462,6 +462,25 @@ func main() {
+ 			engine.SetBannedWords(cfg.BannedWords)
+ 		}
+ 
++		// Wire the cross-agent mention gate. Kept in sync with the same block
++		// in reloadConfig() below — changing only one of the two makes the
++		// gate work after a restart but not after /reload (or vice versa).
++		if self, peers, fallback, gated := mentionRoutingFor(cfg, proj.Name); gated {
++			mediaTarget := mentionMediaTargetFor(cfg)
++			engine.SetMentionRouting(self, peers, fallback)
++			engine.SetMentionSticky(mentionStickyForProcess)
++			engine.SetMentionMediaTarget(mediaTarget)
++			slog.Info("mention gate enabled",
++				"project", proj.Name,
++				"aliases", self,
++				"peer_projects", len(peers),
++				"default", fallback,
++				"media_default", mediaTarget,
++			)
++		} else {
++			engine.SetMentionRouting(nil, nil, "")
++		}
++
+ 		// Wire disabled commands (project-level)
+ 		if len(proj.DisabledCommands) > 0 {
+ 			engine.SetDisabledCommands(proj.DisabledCommands)
+@@ -485,6 +504,8 @@ func main() {
+ 				ThinkingMaxLen:   tmlen,
+ 				ToolMaxLen:       toollen,
+ 				ToolMessages:     tool,
++				AgentLabel:       config.EffectiveAgentLabel(cfg, &proj),
++				ProjectLabel:     config.EffectiveProjectLabel(&proj),
+ 			})
+ 		}
+ 
+@@ -1565,6 +1586,77 @@ func setupLogger(level string, w io.Writer) {
+ 
+ // reloadConfig re-reads config.toml and applies hot-reloadable settings
+ // (display, providers, commands) to the given engine.
++// mentionStickyForProcess is the single stickiness registry shared by every
++// engine in this process.
++//
++// Package scope is deliberate: reloadConfig() runs once per project and has no
++// other way to reach an instance created inside main's project loop. It also has
++// to survive /config reload — the user's "I was just talking to DSH" context does
++// not become invalid because the config file was re-read.
++var mentionStickyForProcess = core.NewMentionSticky(core.DefaultMentionStickyTTL)
++
++// mentionMediaTargetFor returns the ONE project configured to receive messages
++// that carry attachments but no text at all (config: media_default = true).
++// Returns "" when no project claims them.
++//
++// It is a separate lookup from mentionRoutingFor because the two answer different
++// questions: mentionRoutingFor says "is the gate on for me, and who are my
++// peers", while this says "when a photo names nobody, whose is it". The result is
++// handed to EVERY engine, not only to the winner — see Engine.SetMentionMediaTarget.
++func mentionMediaTargetFor(cfg *config.Config) string {
++	if cfg == nil {
++		return ""
++	}
++	for i := range cfg.MentionAgents {
++		m := &cfg.MentionAgents[i]
++		if m.MediaDefault != nil && *m.MediaDefault {
++			return m.Project
++		}
++	}
++	return ""
++}
++
++// mentionRoutingFor resolves the mention-gate policy for one project from the
++// global [[mention_agents]] table.
++//
++// It returns the project's own aliases, every OTHER listed project's aliases,
++// the fallback action, and whether the gate is enabled at all.
++//
++// A project is gated only when it has an entry with enabled = true, but the
++// peers list is built from ALL entries regardless of their own enabled flag:
++// a gated agent must still recognize its peers' names in order to stay quiet,
++// so every agent has to be listed even while only some of them are gated.
++func mentionRoutingFor(cfg *config.Config, projectName string) (self []string, peers map[string][]string, fallback string, enabled bool) {
++	if cfg == nil || len(cfg.MentionAgents) == 0 {
++		return nil, nil, "", false
++	}
++
++	var entry *config.MentionAgentConfig
++	for i := range cfg.MentionAgents {
++		if cfg.MentionAgents[i].Project == projectName {
++			entry = &cfg.MentionAgents[i]
++			break
++		}
++	}
++	if entry == nil || entry.Enabled == nil || !*entry.Enabled || len(entry.Aliases) == 0 {
++		return nil, nil, "", false
++	}
++
++	peers = make(map[string][]string, len(cfg.MentionAgents))
++	for _, m := range cfg.MentionAgents {
++		if m.Project == projectName || len(m.Aliases) == 0 {
++			continue
++		}
++		peers[m.Project] = m.Aliases
++	}
++
++	fallback = strings.TrimSpace(entry.Default)
++	if fallback == "" {
++		fallback = "answer"
++	}
++	return entry.Aliases, peers, fallback, true
++}
++
+ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.ConfigReloadResult, error) {
+ 	cfg, err := config.Load(configPath)
+ 	if err != nil {
+@@ -1594,6 +1686,8 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
+ 		ThinkingMaxLen:   tmlen,
+ 		ToolMaxLen:       toollen,
+ 		ToolMessages:     tool,
++		AgentLabel:       config.EffectiveAgentLabel(cfg, proj),
++		ProjectLabel:     config.EffectiveProjectLabel(proj),
+ 	})
+ 	result.DisplayUpdated = true
+ 
+@@ -1676,6 +1770,26 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
+ 	// Reload banned words
+ 	engine.SetBannedWords(cfg.BannedWords)
+ 
++	// Reload the cross-agent mention gate. Unlike the startup path, this one
++	// MUST clear the policy when the config no longer enables it — otherwise
++	// removing [[mention_agents]] and running /reload would leave the old gate
++	// silently active. Kept in sync with the matching block in main().
++	if self, peers, fallback, gated := mentionRoutingFor(cfg, proj.Name); gated {
++		mediaTarget := mentionMediaTargetFor(cfg)
++		engine.SetMentionRouting(self, peers, fallback)
++		engine.SetMentionSticky(mentionStickyForProcess)
++		engine.SetMentionMediaTarget(mediaTarget)
++		slog.Info("mention gate reloaded",
++			"project", proj.Name,
++			"aliases", self,
++			"peer_projects", len(peers),
++			"default", fallback,
++			"media_default", mediaTarget,
++		)
++	} else {
++		engine.SetMentionRouting(nil, nil, "")
++	}
++
+ 	// Reload disabled commands
+ 	engine.SetDisabledCommands(proj.DisabledCommands)
+ 
+diff --git a/config/config.go b/config/config.go
+index 793aad7..a494dc8 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -105,6 +105,7 @@ type Config struct {
+ 	RateLimit          RateLimitConfig         `toml:"rate_limit"`          // per-session rate limiting
+ 	OutgoingRateLimit  OutgoingRateLimitConfig `toml:"outgoing_rate_limit"` // outgoing message throttling
+ 	Relay              RelayConfig             `toml:"relay"`               // bot-to-bot relay behavior
++	MentionAgents      []MentionAgentConfig    `toml:"mention_agents"`      // cross-agent @ mention gate (see MentionAgentConfig)
+ 	Cron               CronConfig              `toml:"cron"`
+ 	Queue              QueueConfig             `toml:"queue"`
+ 	Webhook            WebhookConfig           `toml:"webhook"`
+@@ -194,6 +195,18 @@ type DisplayConfig struct {
+ 	ToolMessages         *bool   `toml:"tool_messages"`          // whether tool progress messages are shown; default true
+ 	ShowContextIndicator *bool   `toml:"show_context_indicator"` // whether [ctx: ~N%] suffix is shown; default true
+ 	ReplyFooter          *bool   `toml:"reply_footer"`           // whether Codex-like footer is shown; default true
++	// AgentLabel is an outgoing-message prefix that tells the user WHICH project
++	// sent a message. It matters when several projects share one messaging
++	// account — every project consumes every inbound message, so without a label
++	// the user cannot tell the replies apart.
++	//
++	// The value is a template containing the {label} placeholder, which is
++	// replaced by the project's `label` field (falling back to the project
++	// name). Typical value: "【{label}】".
++	//
++	// Empty string (the default) disables labelling and keeps upstream
++	// behaviour byte-for-byte.
++	AgentLabel *string `toml:"agent_label"`
+ }
+ 
+ // StreamPreviewConfig controls real-time streaming preview in IM.
+@@ -252,6 +265,72 @@ type RelayConfig struct {
+ 	Visibility  string `toml:"visibility,omitempty"` // "full" (default), "summary", or "none" for group visibility echoes
+ }
+ 
++// MentionAgentConfig declares one agent's @ mention aliases for the
++// cross-agent mention gate.
++//
++// The gate addresses a problem specific to running MULTIPLE projects against
++// the SAME messaging account: every project consumes every incoming message,
++// so when a user writes "@dsh do X" the Claude bridge also starts a turn and
++// bills tokens only to answer NO_REPLY. With this configured and enabled, the
++// non-addressed agent drops the message BEFORE spawning its process.
++//
++// Only projects with enabled = true are gated; the rest keep their current
++// behavior. Every agent should still be listed, because a gated project needs
++// its peers' aliases in order to recognize "this names someone else".
++//
++//	[[mention_agents]]
++//	project = "my-project"          # must match a [[projects]] name
++//	aliases = ["@claude", "@cc"]    # how users address this agent
++//	enabled = true                  # false or omitted = gate off for this project
++//	default = "answer"              # no alias present at all: answer | silent
++type MentionAgentConfig struct {
++	Project string   `toml:"project"`
++	Aliases []string `toml:"aliases"`
++	Enabled *bool    `toml:"enabled,omitempty"`
++	Default string   `toml:"default,omitempty"`
++	// MediaDefault marks THIS project as the handler for messages that carry
++	// attachments but no text at all — a Weixin photo is the case that motivated
++	// it, because the client cannot attach a caption (the image preview screen
++	// has no text box) and quoting either side of the pair loses the other half.
++	// The alias therefore always arrives as a SEPARATE message, leaving the photo
++	// itself unaddressed.
++	//
++	// Set it on exactly one project. When none does, such messages keep the
++	// pre-existing behaviour: default="silent" projects drop them.
++	MediaDefault *bool `toml:"media_default,omitempty"`
++}
++
++// NormalizeMentionAlias canonicalizes a single alias: trims surrounding
++// space, lowercases it, and guarantees exactly one leading "@". Returns ""
++// when the input carries no name characters (e.g. "" or "@").
++func NormalizeMentionAlias(s string) string {
++	s = strings.ToLower(strings.TrimSpace(s))
++	s = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(s), "@"))
++	if s == "" {
++		return ""
++	}
++	return "@" + s
++}
++
++// normalizeMentionAliasList applies NormalizeMentionAlias to a list, dropping
++// empties and duplicates while preserving the original order.
++func normalizeMentionAliasList(in []string) []string {
++	if len(in) == 0 {
++		return nil
++	}
++	out := make([]string, 0, len(in))
++	seen := make(map[string]bool, len(in))
++	for _, a := range in {
++		n := NormalizeMentionAlias(a)
++		if n == "" || seen[n] {
++			continue
++		}
++		seen[n] = true
++		out = append(out, n)
++	}
++	return out
++}
++
+ // SpeechConfig configures speech-to-text for voice messages.
+ type SpeechConfig struct {
+ 	Enabled  bool   `toml:"enabled"`
+@@ -465,6 +544,11 @@ type ProjectConfig struct {
+ 	Mode    string `toml:"mode,omitempty"`     // "" or "multi-workspace"
+ 	BaseDir string `toml:"base_dir,omitempty"` // parent dir for workspaces
+ 	SkipGit *bool  `toml:"skip_git,omitempty"`
++	// Label is the short human-facing name used by the display.agent_label
++	// prefix, e.g. "Claude" or "WorkBuddy". When empty, Name is used instead.
++	// It exists separately from agent.options.display_name because that key is
++	// consumed by the ACP agent itself (agent/acp) and is not a project field.
++	Label string `toml:"label,omitempty"`
+ 	// WorkspaceInitAllowLocalPaths allows /workspace init and the conversational
+ 	// init flow to bind existing local directories. Default false keeps init
+ 	// limited to git URLs; use /workspace bind or /workspace route for explicit
+@@ -962,6 +1046,61 @@ func EffectiveCardMode(cfg *Config, proj *ProjectConfig) string {
+ 	return "legacy"
+ }
+ 
++// EffectiveAgentLabel resolves the outgoing-message prefix for one project.
++//
++// The template comes from display.agent_label (project-level wins over global),
++// and its {label} placeholder is replaced by the project's `label` field —
++// falling back to the project name when that field is empty.
++//
++// Returns "" when labelling is disabled, which is the default: a project with
++// no agent_label configured behaves exactly as it did before this option
++// existed.
++func EffectiveAgentLabel(cfg *Config, proj *ProjectConfig) string {
++	format := ""
++	if proj != nil && proj.Display != nil && proj.Display.AgentLabel != nil {
++		format = *proj.Display.AgentLabel
++	} else if cfg != nil && cfg.Display.AgentLabel != nil {
++		format = *cfg.Display.AgentLabel
++	}
++	if strings.TrimSpace(format) == "" {
++		return ""
++	}
++
++	name := projectDisplayLabel(proj)
++	if name == "" {
++		return ""
++	}
++
++	// A template without {label} is used verbatim, so operators can hard-code a
++	// literal prefix such as "[BOT] " when they prefer that.
++	return strings.ReplaceAll(format, "{label}", name)
++}
++
++// projectDisplayLabel returns the bare human-facing name for a project: its
++// `label` field when non-empty, otherwise the project name. Returns "" only
++// when there is no project at all.
++func projectDisplayLabel(proj *ProjectConfig) string {
++	if proj == nil {
++		return ""
++	}
++	if s := strings.TrimSpace(proj.Label); s != "" {
++		return s
++	}
++	return strings.TrimSpace(proj.Name)
++}
++
++// EffectiveProjectLabel returns the BARE display name of a project, e.g.
++// "WorkBuddy" — what message bodies use when they must name the agent that is
++// busy or that failed ("当前占用：WorkBuddy").
++//
++// It is the same string EffectiveAgentLabel wraps in brackets, exposed
++// separately so a message body never has to strip punctuation back out of a
++// rendered prefix. Callers fall back to their own project name when this
++// returns "".
++func EffectiveProjectLabel(proj *ProjectConfig) string {
++	return projectDisplayLabel(proj)
++}
++
+ // validatePermissive is like validate but skips the "at least one platform"
+ // requirement so that commands like `cc-connect web` can operate on agent-only
+ // configs before platforms have been set up.
+@@ -1036,6 +1175,59 @@ func (c *Config) validateInternal(permissive bool) error {
+ 			return err
+ 		}
+ 	}
++	if err := validateMentionAgents(c); err != nil {
++		return err
++	}
++	return nil
++}
++
++// validateMentionAgents checks the global [[mention_agents]] table. The gate
++// is opt-in per project, so an empty table is always valid.
++func validateMentionAgents(c *Config) error {
++	if len(c.MentionAgents) == 0 {
++		return nil
++	}
++
++	known := make(map[string]bool, len(c.Projects))
++	for _, p := range c.Projects {
++		known[p.Name] = true
++	}
++
++	// alias → project that claimed it, to catch ambiguous configuration.
++	owner := make(map[string]string)
++	seenProject := make(map[string]bool)
++
++	for i, m := range c.MentionAgents {
++		prefix := fmt.Sprintf("mention_agents[%d]", i)
++
++		if m.Project == "" {
++			return fmt.Errorf("config: %s.project is required", prefix)
++		}
++		if !known[m.Project] {
++			return fmt.Errorf("config: %s.project %q does not match any [[projects]] name", prefix, m.Project)
++		}
++		if seenProject[m.Project] {
++			return fmt.Errorf("config: %s.project %q is declared more than once", prefix, m.Project)
++		}
++		seenProject[m.Project] = true
++
++		aliases := normalizeMentionAliasList(m.Aliases)
++		if len(aliases) == 0 {
++			return fmt.Errorf("config: %s (%s) needs at least one non-empty alias", prefix, m.Project)
++		}
++		for _, a := range aliases {
++			if prev, ok := owner[a]; ok {
++				return fmt.Errorf("config: alias %q is claimed by both %q and %q", a, prev, m.Project)
++			}
++			owner[a] = m.Project
++		}
++
++		switch strings.ToLower(strings.TrimSpace(m.Default)) {
++		case "", "answer", "silent":
++		default:
++			return fmt.Errorf("config: %s.default must be \"answer\" or \"silent\", got %q", prefix, m.Default)
++		}
++	}
+ 	return nil
+ }
+ 
+diff --git a/core/engine.go b/core/engine.go
+index 238cb9f..dd57e76 100644
+--- a/core/engine.go
++++ b/core/engine.go
+@@ -148,7 +148,7 @@ func (e *Engine) SendRestartNotification(platformName, sessionKey string) {
+ 			slog.Debug("restart notify: outgoing wait cancelled or limited", "platform", platformName, "error", err)
+ 			return
+ 		}
+-		if err := p.Send(e.ctx, rctx, text); err != nil {
++		if err := p.Send(e.ctx, rctx, e.stampAgentLabel(text)); err != nil {
+ 			slog.Debug("restart notify: send failed", "error", err)
+ 		}
+ 		return
+@@ -168,6 +168,18 @@ type DisplayCfg struct {
+ 	ThinkingMaxLen   int // max runes for thinking preview; 0 = no truncation
+ 	ToolMaxLen       int // max runes for tool use preview; 0 = no truncation
+ 	ToolMessages     bool
++	// AgentLabel is the fully-rendered prefix prepended to every outgoing
++	// message, e.g. "【WorkBuddy】". It lets the user tell which project sent a
++	// message when several projects share one messaging account. Empty string
++	// disables labelling. Resolved by config.EffectiveAgentLabel.
++	AgentLabel string
++	// ProjectLabel is the BARE display name of this project, e.g. "WorkBuddy",
++	// used when a message body has to name the agent that is busy or that
++	// failed ("当前占用：WorkBuddy"). It is the same string AgentLabel wraps in
++	// brackets, kept separate so callers never have to strip punctuation.
++	// Empty string falls back to the project name. Resolved by
++	// config.EffectiveProjectLabel.
++	ProjectLabel string
+ }
+ 
+ // InstantReplyCfg controls the immediate confirmation reply sent when a message
+@@ -231,6 +243,31 @@ type Engine struct {
+ 	bannedWords []string
+ 	bannedMu    sync.RWMutex
+ 
++	// Mention gate: when enabled (mentionAliases non-empty), a message that
++	// addresses ANOTHER agent's alias is dropped before any agent process is
++	// spawned, so the skipped turn costs zero tokens. This matters when
++	// several projects share one messaging account, because every project
++	// would otherwise consume every message.
++	mentionMu        sync.RWMutex
++	mentionAliases   []string          // this engine's aliases, lowercased, longest first
++	mentionPeerAlias []string          // peers' aliases, lowercased, longest first
++	mentionPeerOwner map[string]string // alias → owning project name (for logging)
++	mentionDefault   string            // "answer" (default) or "silent" when no alias matches
++
++	// The gate's second half: messages that carry NO text at all. A Weixin photo
++	// is the motivating case — it arrives with an empty content string and the
++	// client cannot attach a caption, so a "@dsh" sent alongside it is a separate
++	// message and the photo itself names nobody. mentionSticky is the
++	// process-wide "who was addressed most recently" registry shared by every
++	// engine; mentionMediaTarget names the ONE project configured to take
++	// unaddressed media (config: media_default = true), consulted when there is
++	// no sticky mark yet. It is the target's NAME rather than a local boolean so
++	// that a non-target engine can tell "a peer owns this" apart from "nobody
++	// owns this" — the first must drop, the second may fall through to default.
++	// See MentionSticky for the measured Weixin behaviour behind this.
++	mentionSticky      *MentionSticky
++	mentionMediaTarget string
++
+ 	disabledCmds map[string]bool
+ 	adminFrom    string           // comma-separated user IDs for privileged commands; "*" = all allowed users; "" = deny
+ 	userRoles    *UserRoleManager // nil = legacy mode (no per-user policies)
+@@ -693,6 +730,81 @@ func (e *Engine) SetDisplayConfig(cfg DisplayCfg) {
+ 	e.display = cfg
+ }
+ 
++// AgentLabelPrefix reports the rendered outgoing-message prefix ("" when off).
++func (e *Engine) AgentLabelPrefix() string { return e.display.AgentLabel }
++
++// stampAgentLabel prepends the project's agent label to an outgoing message.
++//
++// Motivation: several projects can share a single messaging account, in which
++// case every project consumes every inbound message and the user has no way to
++// tell which one produced a given reply, error, or queue notice. The label
++// makes the origin explicit.
++//
++// It is deliberately applied at the ENGINE's two send choke points rather than
++// in each caller: on platforms without buttons/cards (Weixin is one) Reply and
++// Send are the only two outbound doors, so a single stamp covers everything the
++// user can see.
++//
++// Note: platforms that split long text into multiple chat messages (Weixin
++// does) apply the label to the first chunk only, which is the desired
++// behaviour — the label identifies the sender, it does not need repeating.
++func (e *Engine) stampAgentLabel(content string) string {
++	prefix := e.display.AgentLabel
++	if prefix == "" || content == "" {
++		return content
++	}
++	return prefix + content
++}
++
++// displayName is the bare human-facing name of this project, used when a
++// message BODY has to say who is busy or who failed. Falls back to the project
++// name so the sentence is never left with a blank slot.
++func (e *Engine) displayName() string {
++	if s := strings.TrimSpace(e.display.ProjectLabel); s != "" {
++		return s
++	}
++	return e.name
++}
++
++// mentionPeerHint renders the peer agents' aliases as "@dsh / @claude" so a
++// queued message can tell the user how to hand the work to somebody else.
++// Returns "" when no peers are configured, in which case the caller omits the
++// hint line entirely rather than printing an empty suggestion.
++func (e *Engine) mentionPeerHint() string {
++	e.mentionMu.RLock()
++	defer e.mentionMu.RUnlock()
++	if len(e.mentionPeerAlias) == 0 {
++		return ""
++	}
++	return strings.Join(e.mentionPeerAlias, " / ")
++}
++
++// queuedMessageConfirmation renders the reply sent when a message arrives while
++// the session is still busy. The base sentence answers "did you get it?"; the
++// detail block answers the questions the base sentence left open — which
++// position it holds, which agent is holding the session, and which agent will
++// eventually run it. When peer agents exist it also explains how to redirect
++// the message instead of waiting.
++func (e *Engine) queuedMessageConfirmation(queueDepth int) string {
++	name := e.displayName()
++	body := e.i18n.T(MsgMessageQueued) + "\n" +
++		e.i18n.Tf(MsgMessageQueuedDetail, queueDepth, e.maxQueuedMessages, name, name)
++	if hint := e.mentionPeerHint(); hint != "" {
++		body += "\n" + e.i18n.Tf(MsgMessageQueuedReroute, hint)
++	}
++	return body
++}
++
++// failedToStartSessionNotice renders the reply sent when the agent process for
++// this turn could not be brought up. The project name matters here: several
++// projects share one chat window, so a bare "failed to start agent session"
++// leaves the user guessing WHICH agent broke, and the recovery hint saves them
++// from retrying into the same dead session.
++func (e *Engine) failedToStartSessionNotice() string {
++	return e.i18n.T(MsgFailedToStartAgentSession) + "\n" +
++		e.i18n.Tf(MsgFailedToStartSessionWhom, e.displayName())
++}
++
+ // SetInstantReply configures the immediate confirmation reply.
+ func (e *Engine) SetInstantReply(cfg InstantReplyCfg) {
+ 	e.instantReply = cfg
+@@ -1197,6 +1309,16 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
+ 		Extra:      map[string]any{"job_id": job.ID, "job_description": job.Description},
+ 	})
+ 
++	// Cross-agent mention gate. Cron injects a synthetic message straight into
++	// the processing loop instead of going through handleMessage, so the gate
++	// has to be applied here too; otherwise a scheduled prompt such as
++	// "@dsh run the report" stored on the Claude project would keep waking
++	// Claude even though the gate is enabled. Shell jobs are exempt — they run
++	// a command and never reach an agent, so there is nothing to gate.
++	if !job.IsShellJob() && e.mentionGateBlocked("cron", job.Prompt, job.SessionKey, "cron") {
++		return nil
++	}
++
+ 	sessionKey := job.SessionKey
+ 	platformName := ""
+ 	if idx := strings.Index(sessionKey, ":"); idx > 0 {
+@@ -1405,6 +1527,13 @@ func (e *Engine) ExecuteTimerJob(job *TimerJob) error {
+ 		Extra:      map[string]any{"job_id": job.ID, "job_description": job.Description},
+ 	})
+ 
++	// Cross-agent mention gate — see ExecuteCronJob. Timers inject synthetic
++	// messages the same way, so they bypass handleMessage and need the same
++	// check. Shell jobs are exempt (no agent involved).
++	if !job.IsShellJob() && e.mentionGateBlocked("timer", job.Prompt, job.SessionKey, "timer") {
++		return nil
++	}
++
+ 	sessionKey := job.SessionKey
+ 	platformName := ""
+ 	if idx := strings.Index(sessionKey, ":"); idx > 0 {
+@@ -1977,6 +2106,12 @@ func (e *Engine) finishCronShell(p Platform, replyCtx any, cmd *exec.Cmd, mu *sy
+ // ExecuteHeartbeat runs a heartbeat check by injecting a synthetic message
+ // into the main session, similar to cron but designed for periodic awareness.
+ func (e *Engine) ExecuteHeartbeat(sessionKey, prompt string, silent bool) error {
++	// Cross-agent mention gate — heartbeats inject a synthetic message the same
++	// way cron does, so they bypass handleMessage and need the same check.
++	if e.mentionGateBlocked("heartbeat", prompt, sessionKey, "heartbeat") {
++		return nil
++	}
++
+ 	platformName := ""
+ 	if idx := strings.Index(sessionKey, ":"); idx > 0 {
+ 		platformName = sessionKey[:idx]
+@@ -2251,6 +2386,380 @@ func (e *Engine) resolveAlias(content string) string {
+ 	return content
+ }
+ 
++// ── Cross-agent mention gate ────────────────────────────────
++
++// mentionUnaddressed is the pseudo project name reported when the gate drops a
++// message that carries no known alias while default = "silent".
++const mentionUnaddressed = "(unaddressed)"
++
++// SetMentionRouting installs the mention-gate policy for this engine.
++//
++// self lists the aliases users may use to address THIS agent; peers maps each
++// other project name to its aliases. Both are matched case-insensitively and
++// an alias may be written with or without the leading "@". Passing an empty
++// self disables the gate, which restores the exact pre-existing behavior —
++// that is what keeps the whole feature opt-in and regression-free.
++//
++// defaultAction decides what happens when the message contains no known alias
++// at all: "answer" (default) lets it through, "silent" drops it.
++func (e *Engine) SetMentionRouting(self []string, peers map[string][]string, defaultAction string) {
++	selfAliases := normalizeMentionAliases(self)
++
++	var peerAliases []string
++	peerOwner := make(map[string]string)
++	for project, aliases := range peers {
++		for _, a := range normalizeMentionAliases(aliases) {
++			if _, dup := peerOwner[a]; dup {
++				continue
++			}
++			peerOwner[a] = project
++			peerAliases = append(peerAliases, a)
++		}
++	}
++	sort.Slice(peerAliases, func(i, j int) bool {
++		return len(peerAliases[i]) > len(peerAliases[j])
++	})
++
++	action := strings.ToLower(strings.TrimSpace(defaultAction))
++	if action != "silent" {
++		action = "answer"
++	}
++
++	e.mentionMu.Lock()
++	defer e.mentionMu.Unlock()
++	e.mentionAliases = selfAliases
++	e.mentionPeerAlias = peerAliases
++	e.mentionPeerOwner = peerOwner
++	e.mentionDefault = action
++}
++
++// SetMentionSticky installs the process-wide registry that remembers which
++// project a session last addressed. Without it the gate still works, but a
++// text-less media message can only be resolved by the plain default — which is
++// what made a photo vanish on a project configured with default = "silent".
++func (e *Engine) SetMentionSticky(s *MentionSticky) {
++	e.mentionMu.Lock()
++	defer e.mentionMu.Unlock()
++	e.mentionSticky = s
++}
++
++// SetMentionMediaTarget names the ONE project configured to receive media that
++// names nobody (config: media_default = true on that project). Pass "" when no
++// project claims it, in which case unaddressed media falls through to the plain
++// default and behaves exactly as before this option existed.
++//
++// Every engine in the process is told the same target name — not merely whether
++// it is the target itself — because a non-target engine must distinguish "a peer
++// owns this photo" (drop it) from "nobody owns it" (fall through to default,
++// which an "answer" project would then take).
++func (e *Engine) SetMentionMediaTarget(project string) {
++	e.mentionMu.Lock()
++	defer e.mentionMu.Unlock()
++	e.mentionMediaTarget = strings.TrimSpace(project)
++}
++
++// MentionGateEnabled reports whether the mention gate is active on this engine.
++func (e *Engine) MentionGateEnabled() bool {
++	e.mentionMu.RLock()
++	defer e.mentionMu.RUnlock()
++	return len(e.mentionAliases) > 0
++}
++
++// mentionGateDrop decides whether the message should be dropped because it
++// addresses another agent. It returns the addressed project name and the
++// matched token; an empty project name means "do not drop".
++//
++// The rule is positional, not set-based: the FIRST alias that appears in the
++// message wins. A set-based rule ("drop whenever a peer alias appears
++// anywhere") breaks on messages that address several agents, e.g.
++// "@claude ask @dsh to run it" — it would silence BOTH agents and the user
++// would see no reply at all, which is the worst possible failure mode.
++func (e *Engine) mentionGateDrop(content string) (string, string) {
++	e.mentionMu.RLock()
++	self := e.mentionAliases
++	peerAliases := e.mentionPeerAlias
++	peerOwner := e.mentionPeerOwner
++	fallback := e.mentionDefault
++	e.mentionMu.RUnlock()
++
++	if len(self) == 0 {
++		return "", "" // gate disabled for this engine
++	}
++
++	for _, token := range scanMentionTokens(content) {
++		selfAlias, selfHit := longestAliasPrefix(token, self)
++		peerAlias, peerHit := longestAliasPrefix(token, peerAliases)
++
++		if selfHit && (!peerHit || len(selfAlias) >= len(peerAlias)) {
++			return "", "" // addressed to us — let it through
++		}
++		if peerHit {
++			owner := peerOwner[peerAlias]
++			if owner == "" {
++				owner = peerAlias
++			}
++			return owner, token
++		}
++	}
++
++	// The message mentions nobody we know.
++	if fallback == "silent" {
++		return mentionUnaddressed, ""
++	}
++	return "", ""
++}
++
++// mentionGateBlocked reports whether a message addresses a DIFFERENT agent and,
++// if so, logs the drop so the caller can return early. Every delivery path is
++// expected to go through this helper.
++//
++// Only handleMessage is reached by live chat traffic. Cron, timer, heartbeat
++// and webhook inject synthetic messages straight into the processing loop and
++// would otherwise bypass the gate entirely — a scheduled prompt such as
++// "@dsh run the report" stored on the Claude project would keep waking Claude
++// every morning even though the gate is on. Those callers must invoke this
++// helper BEFORE resolving platforms or locking sessions, so that a skipped
++// turn costs nothing at all: no notification, no session, no agent process.
++//
++// Slash-command paths (executeCustomCommand / executeSkill) deliberately do
++// NOT call this: they are explicit user commands, and the "/" exemption below
++// keeps them working no matter what their arguments happen to mention.
++//
++// The gate itself is a no-op when this engine has no aliases configured, so a
++// project without a [[mention_agents]] entry behaves exactly as before.
++func (e *Engine) mentionGateBlocked(origin, content, sessionKey, user string) bool {
++	// A command is an instruction to THIS agent by construction, so it is never
++	// read as addressing a peer. Trim first: prompts written as TOML multi-line
++	// strings routinely carry a leading newline or indentation.
++	if strings.HasPrefix(strings.TrimSpace(content), "/") {
++		return false
++	}
++	peer, token := e.mentionGateDrop(content)
++	if peer == "" {
++		// The message stays with us. When it named us explicitly, remember that
++		// for a short while so a follow-up message that names nobody — a bare
++		// Weixin photo above all — still arrives here. Messages that merely fall
++		// through on default="answer" deliberately do NOT create stickiness: an
++		// unaddressed aside in a multi-project chat would otherwise silently
++		// steal the next photo from the project the user actually addressed.
++		if e.mentionsSelf(content) {
++			e.rememberAddressee(sessionKey)
++		}
++		return false
++	}
++	slog.Info("mention gate: message dropped",
++		"project", e.name,
++		"origin", origin,
++		"addressed", peer,
++		"token", token,
++		"session", sessionKey,
++		"user", user,
++	)
++	return true
++}
++
++// rememberAddressee records this project as the session's most recent target.
++func (e *Engine) rememberAddressee(sessionKey string) {
++	e.mentionMu.RLock()
++	sticky := e.mentionSticky
++	e.mentionMu.RUnlock()
++	sticky.Mark(sessionKey, e.name)
++}
++
++// mentionsSelf reports whether content explicitly names this agent, applying the
++// same positional rule as the gate itself: the FIRST known alias in the message
++// decides, and only then does it matter whether that alias is ours.
++//
++// This mirrors mentionGateDrop on purpose. If the two diverged, a message could
++// be simultaneously "kept by the gate" and "not recognised as addressed to us",
++// and the stickiness it created would then be one the gate never honours.
++func (e *Engine) mentionsSelf(content string) bool {
++	e.mentionMu.RLock()
++	self := e.mentionAliases
++	peerAliases := e.mentionPeerAlias
++	e.mentionMu.RUnlock()
++	if len(self) == 0 {
++		return false
++	}
++	for _, token := range scanMentionTokens(content) {
++		selfAlias, selfHit := longestAliasPrefix(token, self)
++		peerAlias, peerHit := longestAliasPrefix(token, peerAliases)
++		if selfHit && (!peerHit || len(selfAlias) >= len(peerAlias)) {
++			return true
++		}
++		if peerHit {
++			return false
++		}
++	}
++	return false
++}
++
++// bareMediaMessage reports whether a message carries attachments but no text.
++//
++// This is the shape a Weixin photo always has. The content check trims first
++// because platforms differ on whether they send "" or a whitespace-only body for
++// a caption-less attachment.
++func bareMediaMessage(msg *Message) bool {
++	if msg == nil || strings.TrimSpace(msg.Content) != "" {
++		return false
++	}
++	return len(msg.Images) > 0 || len(msg.Files) > 0 || msg.Audio != nil
++}
++
++// mediaRouteOwner resolves who should receive a text-less media message.
++//
++// claimed=false means "nobody claims it, use the plain default". When claimed is
++// true, `mine` tells this engine whether it is the owner — the two are separate
++// so that a peer being the owner results in a DROP rather than a fall-through to
++// default="answer".
++func (e *Engine) mediaRouteOwner(sessionKey string) (claimed bool, mine bool, owner string) {
++	e.mentionMu.RLock()
++	sticky := e.mentionSticky
++	target := e.mentionMediaTarget
++	self := e.name
++	e.mentionMu.RUnlock()
++
++	if owner := sticky.Lookup(sessionKey); owner != "" {
++		return true, owner == self, owner
++	}
++	if target != "" {
++		return true, target == self, target
++	}
++	return false, false, ""
++}
++
++// mentionGateBlocksMessage is the gate entry point for LIVE CHAT traffic, and it
++// differs from mentionGateBlocked in exactly one respect: it understands that a
++// message carrying attachments and no text has no aliases to scan.
++//
++// Without this, a Weixin photo sent to a project the user had just addressed was
++// read as "addressing nobody", hit default="silent", and was discarded — the
++// picture simply never arrived, and the user saw a project that "did not react".
++// Measured 2026-09-19: the Weixin client cannot attach a caption (the image
++// preview has no text box), quoting a photo drops the photo, and quoting text
++// while sending a photo drops the quote, so the alias can only ever arrive as a
++// separate message. Cron, timer, heartbeat and webhook traffic keeps calling
++// mentionGateBlocked directly: those prompts are authored text, never bare media.
++func (e *Engine) mentionGateBlocksMessage(msg *Message) bool {
++	if !bareMediaMessage(msg) {
++		return e.mentionGateBlocked("message", msg.Content, msg.SessionKey, msg.UserName)
++	}
++
++	if claimed, mine, owner := e.mediaRouteOwner(msg.SessionKey); claimed {
++		if mine {
++			slog.Info("mention gate: media message kept",
++				"project", e.name,
++				"owner", owner,
++				"session", msg.SessionKey,
++				"user", msg.UserName,
++			)
++			return false
++		}
++		slog.Info("mention gate: media message dropped",
++			"project", e.name,
++			"origin", "message",
++			"addressed", owner,
++			"token", "(media)",
++			"session", msg.SessionKey,
++			"user", msg.UserName,
++		)
++		return true
++	}
++
++	// Nobody was addressed recently and no media owner is configured: keep the
++	// pre-existing rule, so an unconfigured deployment behaves exactly as before.
++	return e.mentionGateBlocked("message", msg.Content, msg.SessionKey, msg.UserName)
++}
++
++// normalizeMentionAliases canonicalizes aliases: trimmed, lowercased, exactly
++// one leading "@", deduplicated, and sorted longest-first so that prefix
++// matching prefers the most specific alias ("@claude-code" over "@claude").
++func normalizeMentionAliases(in []string) []string {
++	if len(in) == 0 {
++		return nil
++	}
++	out := make([]string, 0, len(in))
++	seen := make(map[string]bool, len(in))
++	for _, raw := range in {
++		a := strings.ToLower(strings.TrimSpace(raw))
++		a = strings.TrimSpace(strings.TrimPrefix(a, "@"))
++		if a == "" {
++			continue
++		}
++		a = "@" + a
++		if seen[a] {
++			continue
++		}
++		seen[a] = true
++		out = append(out, a)
++	}
++	sort.Slice(out, func(i, j int) bool { return len(out[i]) > len(out[j]) })
++	return out
++}
++
++// longestAliasPrefix returns the longest alias that prefixes token. Aliases
++// are expected lowercase and sorted longest-first, because the first hit is
++// then the most specific one. Comparison is byte-wise on purpose: it is only
++// ever applied between a token and one of its own prefixes, so the result is
++// identical to a rune-wise comparison while avoiding a conversion per call.
++func longestAliasPrefix(token string, aliases []string) (string, bool) {
++	for _, a := range aliases {
++		if strings.HasPrefix(token, a) {
++			return a, true
++		}
++	}
++	return "", false
++}
++
++// scanMentionTokens extracts every "@name" token from content in the order it
++// appears. Names may contain letters, digits, "_", "-", and CJK characters —
++// the CJK part matters because Chinese has no word separators, so "@dsh你好"
++// must yield the token "@dsh你好"; the alias matcher then treats "@dsh" as a
++// prefix of it.
++//
++// A "@" is only treated as a mention when it is NOT preceded by a name
++// character, which keeps email addresses and handles such as
++// "a@dsh.example" from being mistaken for a mention.
++func scanMentionTokens(content string) []string {
++	runes := []rune(content)
++	var out []string
++	for i := 0; i < len(runes); i++ {
++		if runes[i] != '@' {
++			continue
++		}
++		if i > 0 && isMentionNameRune(runes[i-1]) {
++			continue
++		}
++		j := i + 1
++		for j < len(runes) && isMentionNameRune(runes[j]) {
++			j++
++		}
++		if j > i+1 {
++			out = append(out, strings.ToLower(string(runes[i:j])))
++		}
++		i = j - 1
++	}
++	return out
++}
++
++// isMentionNameRune reports whether r can be part of an "@name" token.
++func isMentionNameRune(r rune) bool {
++	switch {
++	case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
++		return true
++	case r == '_' || r == '-':
++		return true
++	case r >= 0x4e00 && r <= 0x9fff: // CJK Unified Ideographs
++		return true
++	case r >= 0x3040 && r <= 0x30ff: // Hiragana + Katakana
++		return true
++	case r >= 0xac00 && r <= 0xd7af: // Hangul syllables
++		return true
++	}
++	return false
++}
++
++
+ func (e *Engine) handleMessageRecall(p Platform, msg *Message) {
+ 	messageID := strings.TrimSpace(msg.MessageID)
+ 	if messageID == "" {
+@@ -2588,6 +3097,20 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
+ 		}
+ 	}
+ 
++	// Cross-agent mention gate: when this engine is gated and the message
++	// addresses a DIFFERENT agent, drop it here — before any agent process is
++	// spawned — so the skipped turn costs zero tokens. Runs after the banned
++	// word check so the content is already finalized (alias resolution and
++	// ExtraContent merging both happen above).
++	//
++	// mentionGateBlocksMessage (not mentionGateBlocked) because a Weixin photo
++	// arrives with empty content and nothing to scan for aliases; that entry
++	// point resolves such messages through stickiness and the media_default
++	// setting instead of failing straight through to default="silent".
++	if e.mentionGateBlocksMessage(msg) {
++		return
++	}
++
+ 	// Multi-workspace resolution
+ 	var wsAgent Agent
+ 	var wsSessions *SessionManager
+@@ -2880,7 +3403,7 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
+ 		"user", msg.UserName,
+ 		"queue_depth", queueDepth,
+ 	)
+-	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMessageQueued))
++	e.reply(p, msg.ReplyCtx, e.queuedMessageConfirmation(queueDepth))
+ 	return true
+ }
+ 
+@@ -3381,7 +3904,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
+ 	defer stopRecallMonitor()
+ 
+ 	if state.agentSession == nil {
+-		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgFailedToStartAgentSession))
++		e.reply(p, msg.ReplyCtx, e.failedToStartSessionNotice())
+ 		return
+ 	}
+ 
+@@ -10359,12 +10882,12 @@ func (e *Engine) SendToSessionWithAttachments(sessionKey, message string, images
+ 					return err
+ 				}
+ 			} else {
+-				if err := p.Send(e.ctx, replyCtx, message); err != nil {
++				if err := p.Send(e.ctx, replyCtx, e.stampAgentLabel(message)); err != nil {
+ 					return err
+ 				}
+ 			}
+ 		} else {
+-			if err := p.Send(e.ctx, replyCtx, message); err != nil {
++			if err := p.Send(e.ctx, replyCtx, e.stampAgentLabel(message)); err != nil {
+ 				return err
+ 			}
+ 		}
+@@ -10869,6 +11392,7 @@ func (e *Engine) sendWithError(p Platform, replyCtx any, content string) error {
+ }
+ 
+ func (e *Engine) sendAlreadyRenderedWithError(p Platform, replyCtx any, content string) error {
++	content = e.stampAgentLabel(content)
+ 	start := time.Now()
+ 	if err := p.Send(e.ctx, replyCtx, content); err != nil {
+ 		// Check for context_token missing error (common for Weixin platform)
+@@ -10929,6 +11453,7 @@ func drainEvents(ch <-chan Event) {
+ 
+ // replyWithError applies outgoing rate limiting and p.Reply.
+ func (e *Engine) replyWithError(p Platform, replyCtx any, content string) error {
++	content = e.stampAgentLabel(content)
+ 	if err := e.waitOutgoing(p); err != nil {
+ 		slog.Warn("outgoing rate limit: context cancelled", "platform", p.Name(), "error", err)
+ 		return err
+diff --git a/core/i18n.go b/core/i18n.go
+index 410588a..54d674f 100644
+--- a/core/i18n.go
++++ b/core/i18n.go
+@@ -174,6 +174,8 @@ const (
+ 	MsgPreviousProcessing        MsgKey = "previous_processing"
+ 	MsgQueueFull                 MsgKey = "queue_full"
+ 	MsgMessageQueued             MsgKey = "message_queued"
++	MsgMessageQueuedDetail       MsgKey = "message_queued_detail"
++	MsgMessageQueuedReroute      MsgKey = "message_queued_reroute"
+ 	MsgNoToolsAllowed            MsgKey = "no_tools_allowed"
+ 	MsgCurrentTools              MsgKey = "current_tools"
+ 	MsgCurrentSession            MsgKey = "current_session"
+@@ -183,6 +185,7 @@ const (
+ 	MsgError                     MsgKey = "error"
+ 	MsgSessionNotFound           MsgKey = "session_not_found"
+ 	MsgFailedToStartAgentSession MsgKey = "failed_to_start_agent_session"
++	MsgFailedToStartSessionWhom  MsgKey = "failed_to_start_session_whom"
+ 	MsgFailedToDeleteSession     MsgKey = "failed_to_delete_session"
+ 	MsgEmptyResponse             MsgKey = "empty_response"
+ 	MsgPermissionPrompt          MsgKey = "permission_prompt"
+@@ -751,6 +754,26 @@ var messages = map[MsgKey]map[Language]string{
+ 		LangJapanese:           "📬 メッセージキューが満杯です（%d 件待ち）。現在のタスク完了をお待ちください。",
+ 		LangSpanish:            "📬 La cola de mensajes está llena (%d pendientes). Espere a que las tareas actuales se completen.",
+ 	},
++	// MsgMessageQueuedDetail is appended under MsgMessageQueued so the user can
++	// tell WHERE the message landed (queue position) and WHO is holding the
++	// session. Args: depth, capacity, busy-agent, handling-agent.
++	MsgMessageQueuedDetail: {
++		LangEnglish:            "· Queue: position %d of %d\n· Currently busy: %s (working on the previous turn)\n· This message will be handled by %s as soon as it frees up",
++		LangChinese:            "· 排队：第 %d/%d 位\n· 当前占用：%s（正在处理上一轮）\n· 本条由 %s 处理，等它空出来即自动执行",
++		LangTraditionalChinese: "· 排隊：第 %d/%d 位\n· 目前佔用：%s（正在處理上一輪）\n· 本則由 %s 處理，等它空出來即自動執行",
++		LangJapanese:           "· 待ち行列：%d/%d 番目\n· 現在ビジー：%s（前のターンを処理中）\n· このメッセージは %s が処理します（空き次第自動実行）",
++		LangSpanish:            "· Cola: posición %d de %d\n· Ocupado ahora: %s (procesando el turno anterior)\n· Este mensaje lo atenderá %s en cuanto se libere",
++	},
++	// MsgMessageQueuedReroute is appended only when peer agents exist, so the
++	// user learns how to hand a queued message to a different agent.
++	// Args: a rendered alias hint such as "@dsh / @claude".
++	MsgMessageQueuedReroute: {
++		LangEnglish:            "· To hand it to another agent: resend with %s at the start",
++		LangChinese:            "· 想改派他人：在消息开头写 %s 重发",
++		LangTraditionalChinese: "· 想改派他人：在訊息開頭寫 %s 重送",
++		LangJapanese:           "· 別のエージェントに任せる場合：メッセージの先頭に %s を付けて再送",
++		LangSpanish:            "· Para asignarlo a otro agente: reenvíalo empezando con %s",
++	},
+ 	MsgNoToolsAllowed: {
+ 		LangEnglish:            "No tools pre-allowed.\nUsage: `/allow <tool_name>`\nExample: `/allow Bash`",
+ 		LangChinese:            "尚未预授权任何工具。\n用法: `/allow <工具名>`\n示例: `/allow Bash`",
+@@ -821,6 +844,16 @@ var messages = map[MsgKey]map[Language]string{
+ 		LangJapanese:           "❌ エラー: Agentセッションの起動に失敗しました",
+ 		LangSpanish:            "❌ Error: error al iniciar la sesión del agente",
+ 	},
++	// MsgFailedToStartSessionWhom is appended under MsgFailedToStartAgentSession
++	// to name the project whose session died and to offer the recovery path.
++	// Args: the project's display name.
++	MsgFailedToStartSessionWhom: {
++		LangEnglish:            "· Agent that failed: %s\n· Try: send /stop to clear the stuck session and resend, or /new for a fresh one",
++		LangChinese:            "· 出错的 Agent：%s\n· 可试：发 /stop 清掉卡住的会话后重发，或用 /new 换新会话",
++		LangTraditionalChinese: "· 出錯的 Agent：%s\n· 可試：發 /stop 清掉卡住的工作階段後重送，或用 /new 換新工作階段",
++		LangJapanese:           "· 失敗した Agent：%s\n· 対処：/stop でスタックしたセッションを解放して再送、または /new で新規セッション",
++		LangSpanish:            "· Agente que falló: %s\n· Prueba: envía /stop para liberar la sesión bloqueada y reenvía, o /new para una nueva",
++	},
+ 	MsgFailedToDeleteSession: {
+ 		LangEnglish:            "❌ %s: %v",
+ 		LangChinese:            "❌ %s: %v",
+diff --git a/core/mention_sticky.go b/core/mention_sticky.go
+new file mode 100644
+index 0000000..0f8df15
+--- /dev/null
++++ b/core/mention_sticky.go
+@@ -0,0 +1,107 @@
++package core
++
++import (
++	"sync"
++	"time"
++)
++
++// DefaultMentionStickyTTL is how long a project stays "the one being talked to"
++// after a user addresses it by alias.
++//
++// Why this exists: a Weixin photo arrives as a message with NO text at all
++// (content is the empty string), and the Weixin client offers no way to attach a
++// caption. Measured on this machine (2026-09-19):
++//
++//   - the image preview screen has no text box, so text and photo cannot be one
++//     message;
++//   - quoting a photo and typing text delivers the text but DROPS the photo
++//     (has_images=false);
++//   - quoting text and sending a photo delivers the photo but DROPS the quote
++//     (content_len=0).
++//
++// So "@dsh look at this" plus a photo always arrives as two messages, and the
++// second one names nobody. Without stickiness the gate reads that photo as
++// unaddressed and a project with default="silent" throws it away — which is
++// exactly what the user experiences as "the picture never reached the agent".
++//
++// Three minutes is deliberately short: long enough to cover "type the alias,
++// then pick a photo", short enough that someone who walked away does not
++// silently route a much later photo to a project they forgot they addressed.
++const DefaultMentionStickyTTL = 3 * time.Minute
++
++// MentionSticky remembers, per chat session, the project most recently addressed
++// by alias.
++//
++// ONE instance is shared by every engine in the process. The routing question
++// ("is this bare photo mine?") can only be answered by comparing what this engine
++// is called against what the session last addressed — knowledge no single engine
++// holds on its own, since each engine only ever sees its own aliases.
++type MentionSticky struct {
++	ttl time.Duration
++
++	mu    sync.Mutex
++	marks map[string]mentionStickyMark
++}
++
++type mentionStickyMark struct {
++	project string
++	at      time.Time
++}
++
++// NewMentionSticky builds a registry. A ttl <= 0 falls back to
++// DefaultMentionStickyTTL, so a zero value can never silently mean "expires
++// instantly" or "never expires".
++func NewMentionSticky(ttl time.Duration) *MentionSticky {
++	if ttl <= 0 {
++		ttl = DefaultMentionStickyTTL
++	}
++	return &MentionSticky{ttl: ttl, marks: make(map[string]mentionStickyMark)}
++}
++
++// Mark records that the user just addressed `project` on this session.
++func (s *MentionSticky) Mark(sessionKey, project string) {
++	if s == nil || sessionKey == "" || project == "" {
++		return
++	}
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	s.marks[sessionKey] = mentionStickyMark{project: project, at: time.Now()}
++}
++
++// Lookup returns the project most recently addressed on this session, or "" when
++// there is none or the mark has expired.
++func (s *MentionSticky) Lookup(sessionKey string) string {
++	if s == nil || sessionKey == "" {
++		return ""
++	}
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	mark, ok := s.marks[sessionKey]
++	if !ok {
++		return ""
++	}
++	if time.Since(mark.at) > s.ttl {
++		delete(s.marks, sessionKey)
++		return ""
++	}
++	return mark.project
++}
++
++// Forget drops the mark for one session. Used when a session is reset so a
++// /cancel or /new does not leave a stale owner behind.
++func (s *MentionSticky) Forget(sessionKey string) {
++	if s == nil || sessionKey == "" {
++		return
++	}
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	delete(s.marks, sessionKey)
++}
++
++// TTL reports the configured lifetime (for logging).
++func (s *MentionSticky) TTL() time.Duration {
++	if s == nil {
++		return 0
++	}
++	return s.ttl
++}
+diff --git a/core/webhook.go b/core/webhook.go
+index 6ee5088..039a574 100644
+--- a/core/webhook.go
++++ b/core/webhook.go
+@@ -199,6 +199,14 @@ func (ws *WebhookServer) resolveEngine(project string) (*Engine, error) {
+ }
+ 
+ func (ws *WebhookServer) executePrompt(engine *Engine, sessionKey, prompt string, silent bool, event string) {
++	// Cross-agent mention gate — a webhook injects a synthetic message straight
++	// into the processing loop, bypassing handleMessage. Check before doing any
++	// work so a dropped event costs nothing (no notification, no session, no
++	// agent process).
++	if engine.mentionGateBlocked("webhook", prompt, sessionKey, "webhook") {
++		return
++	}
++
+ 	platformName := ""
+ 	if idx := strings.Index(sessionKey, ":"); idx > 0 {
+ 		platformName = sessionKey[:idx]
+-- 
+2.55.0.windows.3
+

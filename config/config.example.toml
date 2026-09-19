@@ -12,9 +12,13 @@
 #      cc-connect daemon start
 #
 # ⚠️ 核心前提（务必先读 docs/05-能力边界实测.md）：
-#   三个 project 共用同一个微信 bot token 时，一条用户消息会被**原样投给每个
-#   project**（扇出，而非路由）。cc-connect 没有「按内容/@对象 选人投递」的能力，
-#   「谁该回答」只能靠 agent 自己读消息后判断。这是本方案最大的架构约束。
+#   **原生** cc-connect 是扇出，不是路由：三个 project 共用同一个微信 bot token 时，
+#   一条用户消息会被**原样投给每个 project**，「谁该回答」只能靠 agent 自己读消息后判断。
+#   → 本仓库的补丁在引擎层加了**点名关卡（L1）**，把「@ 了谁」变成真正的路由：
+#     命中别人的消息**在进入 agent 之前**就被丢掉（不建会话、不起 agent 进程、不花 token）。
+#     它需要套用 patches/0007 + 0008；**没套补丁时行为仍是纯扇出**。
+#   → 三道防线（L1 关卡 / L2 前置钩子 / L3 输出静默）的分工、边界与实测见
+#     docs/07-点名路由与三层防线-落地报告.md。
 # =============================================================================
 
 
@@ -36,6 +40,64 @@ visibility = "full"
 [display]
 thinking_messages = false
 tool_messages = false
+# agent_label：给**每条出站消息**加来源前缀，让共用同一个微信窗口的多个 agent 可分辨。
+# 用 {label} 占位，替换成该 project 的 label（没设 label 则用 name）。
+#   全局这里配  = 所有 project 都带前缀
+#   单个 project 可在 [projects.display] 里覆盖
+#   两处都不配  = 不加前缀
+# 施加点在引擎的**两个发送咽喉**，所以回复、报错、排队提示都会带上；
+# 长文本被平台切成多条时**只有第一块**带前缀（标识的是「我是谁」，不需要每条重复）。
+agent_label = "[{label}] "
+
+
+# -----------------------------------------------------------------------------
+# 全局：点名路由（L1 —— 引擎层关卡）
+# -----------------------------------------------------------------------------
+# 作用：让「消息里**第一个** @ 记号指向谁」决定这条消息进哪个 project，
+#       而且是在**进入 agent 之前**判定。命中别人的消息在引擎里当场丢掉 ——
+#       不建会话、不起 agent 进程、不花 token。
+#
+# 判定规则：
+#   · 第一个 @ 指向**别的** project → 丢弃
+#   · 第一个 @ 指向**自己**         → 放行
+#   · 没有 @                        → 放行（是否回答由提示词层的 NO_REPLY 约定兜底）
+#
+# 别名归一化：大小写、首尾空白、前导 @ 都可省 —— "@DSH" / " @dsh " / "dsh" 是同一个记号。
+# 匹配按**最长别名前缀**，所以同一个 project 登记 @d 与 @dsh 时，@dsh 不会被 @d 遮住。
+#
+# ⚠️ 别写错：project 必须能对上某个 [[projects]].name；同一个 project 只能声明一次；
+#    同一个别名不能被两个 project 认领；每个条目至少要给一个非空别名 —— 这些在配置
+#    加载阶段就会被拒绝，不会拖到运行期变成诡异的投递行为。
+#
+# 与另外两层的关系（**三层叠加，不是替代**）：见 docs/07-点名路由与三层防线-落地报告.md
+[[mention_agents]]
+project = "my-project"
+aliases = ["@claude"]
+# default 决定「没有点名任何人」的消息在这个 project 里的默认动作：
+#   "answer" —— 照常回答（适合主 agent / 唯一 agent）
+#   "silent" —— 静默（适合「只被点名时才回答」的 agent）
+# 不写则按实现默认走，**建议显式写清**，否则日后很难判断行为来自配置还是默认值。
+default = "answer"
+
+[[mention_agents]]
+project = "my-dsh"
+aliases = ["@dsh"]
+default = "silent"
+
+[[mention_agents]]
+project = "my-workbuddy"
+aliases = ["@wb", "@workbuddy"]
+default = "silent"
+# media_default：微信无法在一条消息里同时发文字和图片（三种绕法都实测失败，
+# 见 docs/08），所以「@dsh」和图片**必然分两条到达**，第二条不含任何点名信息。
+# 本条指定「谁来认领这种没头没主的媒体消息」。
+#   · 整个配置里**只应有一个** project 设 true，建议给额度最充裕的那个；
+#   · 它只在「当前 session 还没有被点名对象」时生效 —— 先点了名再发图，图仍归被点名者
+#     （粘性点名，TTL 3 分钟；且只对**无文字**消息生效，不会污染文字路由）。
+media_default = true
+# enabled（可选，布尔）：显式关掉某个 project 的关卡。不写 = 按 aliases 是否为空判定。
+# 关卡是「按 project 各配一份」，不是全局开关 —— 某个 project 不配就不受关卡保护，
+# 它会重新变成「所有消息都进、全靠 NO_REPLY 闭嘴」的旧行为。
 
 
 # =============================================================================
@@ -43,6 +105,8 @@ tool_messages = false
 # =============================================================================
 [[projects]]
 name = "my-project"
+# label：该 project 的显示名，供上面的 agent_label 出站前缀使用（不设则退回用 name）。
+label = "Claude"
 # ⚠️ admin_from 必须是**字符串**。写成 TOML 表（[projects.admin_from]）会让整个
 #    配置解析失败、服务起不来，且日志只有反复的 instance lock，极难定位。
 admin_from = "<YOUR_OPENID>@im.wechat"
@@ -80,6 +144,7 @@ clean_reply = true
 # DSH 自带标准 ACP server：dsh --profile acp（automation-only JSON-RPC stdio）
 [[projects]]
 name = "my-dsh"
+label = "DSH"
 
 [projects.agent]
 type = "acp"
@@ -114,6 +179,7 @@ clean_reply = true
 #              会话占用）并永久挂起；--acp 不绑该端口。
 [[projects]]
 name = "my-workbuddy"
+label = "WorkBuddy"
 
 [projects.agent]
 type = "acp"

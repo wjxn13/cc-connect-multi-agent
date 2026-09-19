@@ -1,0 +1,1256 @@
+From ca504108720e7a91af6df60f17a9e21879fe71be Mon Sep 17 00:00:00 2001
+From: wjxn13 <236573882+wjxn13@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 23:01:12 +0800
+Subject: [PATCH 8/8] test(core): cover mention routing, agent labels and
+ queued messages
+
+Adds offline coverage for the addressing layer introduced in the previous
+commit. No production code is touched.
+
+* config/agent_label_test.go -- `EffectiveAgentLabel` resolution order
+  (project `label` overrides global `agent_label`), the `{label}` placeholder,
+  and the empty/whitespace cases that must render to "" rather than a bare
+  prefix.
+
+* core/agent_label_test.go -- `stampAgentLabel` is applied once and only once,
+  is skipped for empty content, and leaves content untouched when no label is
+  configured.
+
+* core/mention_route_test.go -- the gate decision table: message naming a peer
+  is dropped, message naming self passes, unaddressed message passes, and the
+  first @token wins when a message names more than one project. Also pins the
+  alias matching rules (case folding, leading whitespace, `@` optional) and the
+  longest-alias-prefix match, so "@dsh" does not get shadowed by a shorter
+  alias that happens to be a prefix of it.
+
+* core/mention_sticky_test.go -- sticky addressee lifecycle: refreshed by an
+  addressed message, consumed by a following text-less (media) message,
+  expired by TTL, and never applied to a message that carries text.
+
+* core/queued_message_test.go -- the queued-message confirmation composes the
+  base sentence, the queue detail block and (only when peer agents exist) the
+  reroute hint, in the right order and without a dangling blank line.
+
+Run: `go test ./core/ ./config/`
+---
+ config/agent_label_test.go  |  80 ++++++
+ core/agent_label_test.go    |  83 ++++++
+ core/mention_route_test.go  | 520 ++++++++++++++++++++++++++++++++++++
+ core/mention_sticky_test.go | 358 +++++++++++++++++++++++++
+ core/queued_message_test.go | 135 ++++++++++
+ 5 files changed, 1176 insertions(+)
+ create mode 100644 config/agent_label_test.go
+ create mode 100644 core/agent_label_test.go
+ create mode 100644 core/mention_route_test.go
+ create mode 100644 core/mention_sticky_test.go
+ create mode 100644 core/queued_message_test.go
+
+diff --git a/config/agent_label_test.go b/config/agent_label_test.go
+new file mode 100644
+index 0000000..78de2e4
+--- /dev/null
++++ b/config/agent_label_test.go
+@@ -0,0 +1,80 @@
++package config
++
++import "testing"
++
++func strptr(s string) *string { return &s }
++
++// TestEffectiveAgentLabel_DisabledByDefault pins the zero-regression property.
++func TestEffectiveAgentLabel_DisabledByDefault(t *testing.T) {
++	cfg := &Config{}
++	proj := &ProjectConfig{Name: "my-workbuddy"}
++	if got := EffectiveAgentLabel(cfg, proj); got != "" {
++		t.Errorf("EffectiveAgentLabel() = %q, want empty", got)
++	}
++}
++
++// TestEffectiveAgentLabel_RendersLabel checks the happy path: a {label}
++// template is replaced by the project's label field.
++func TestEffectiveAgentLabel_RendersLabel(t *testing.T) {
++	cfg := &Config{}
++	cfg.Display.AgentLabel = strptr("【{label}】")
++	proj := &ProjectConfig{Name: "my-workbuddy", Label: "WorkBuddy"}
++	if got, want := EffectiveAgentLabel(cfg, proj), "【WorkBuddy】"; got != want {
++		t.Errorf("EffectiveAgentLabel() = %q, want %q", got, want)
++	}
++}
++
++// TestEffectiveAgentLabel_FallsBackToProjectName covers projects that never set
++// label — the project name keeps the output identifiable.
++func TestEffectiveAgentLabel_FallsBackToProjectName(t *testing.T) {
++	cfg := &Config{}
++	cfg.Display.AgentLabel = strptr("[{label}] ")
++	proj := &ProjectConfig{Name: "my-dsh"}
++	if got, want := EffectiveAgentLabel(cfg, proj), "[my-dsh] "; got != want {
++		t.Errorf("EffectiveAgentLabel() = %q, want %q", got, want)
++	}
++}
++
++// TestEffectiveAgentLabel_ProjectOverridesGlobal mirrors EffectiveCardMode:
++// a project-level value wins over the global one.
++func TestEffectiveAgentLabel_ProjectOverridesGlobal(t *testing.T) {
++	cfg := &Config{}
++	cfg.Display.AgentLabel = strptr("【{label}】")
++	proj := &ProjectConfig{Name: "my-workbuddy", Label: "WorkBuddy"}
++	proj.Display = &DisplayConfig{AgentLabel: strptr("<{label}> ")}
++	if got, want := EffectiveAgentLabel(cfg, proj), "<WorkBuddy> "; got != want {
++		t.Errorf("EffectiveAgentLabel() = %q, want %q", got, want)
++	}
++}
++
++// TestEffectiveAgentLabel_BlankIsOff treats whitespace-only configuration as
++// "disabled" rather than emitting a whitespace prefix.
++func TestEffectiveAgentLabel_BlankIsOff(t *testing.T) {
++	cfg := &Config{}
++	cfg.Display.AgentLabel = strptr("   ")
++	proj := &ProjectConfig{Name: "my-workbuddy"}
++	if got := EffectiveAgentLabel(cfg, proj); got != "" {
++		t.Errorf("EffectiveAgentLabel() = %q, want empty", got)
++	}
++}
++
++// TestEffectiveAgentLabel_LiteralWithoutPlaceholder lets operators hard-code a
++// fixed prefix when they do not want the project name in it.
++func TestEffectiveAgentLabel_LiteralWithoutPlaceholder(t *testing.T) {
++	cfg := &Config{}
++	cfg.Display.AgentLabel = strptr("[BOT] ")
++	proj := &ProjectConfig{Name: "my-workbuddy"}
++	if got, want := EffectiveAgentLabel(cfg, proj), "[BOT] "; got != want {
++		t.Errorf("EffectiveAgentLabel() = %q, want %q", got, want)
++	}
++}
++
++// TestEffectiveAgentLabel_NilProject must not panic — reload paths can call it
++// with a missing project.
++func TestEffectiveAgentLabel_NilProject(t *testing.T) {
++	cfg := &Config{}
++	cfg.Display.AgentLabel = strptr("【{label}】")
++	if got := EffectiveAgentLabel(cfg, nil); got != "" {
++		t.Errorf("EffectiveAgentLabel(nil) = %q, want empty", got)
++	}
++}
+diff --git a/core/agent_label_test.go b/core/agent_label_test.go
+new file mode 100644
+index 0000000..c858712
+--- /dev/null
++++ b/core/agent_label_test.go
+@@ -0,0 +1,83 @@
++package core
++
++import "testing"
++
++// makeLabelEngine builds an engine whose outgoing messages carry a prefix.
++func makeLabelEngine(prefix string) (*Engine, *stubPlatformEngine) {
++	p := &stubPlatformEngine{n: "test"}
++	e := NewEngine("my-workbuddy", &stubAgent{}, []Platform{p}, "", LangEnglish)
++	e.SetDisplayConfig(DisplayCfg{AgentLabel: prefix})
++	return e, p
++}
++
++// TestAgentLabel_DisabledByDefault pins the zero-regression property: without
++// configuration every outbound message must be byte-for-byte what it was
++// before the option existed.
++func TestAgentLabel_DisabledByDefault(t *testing.T) {
++	e, p := makeLabelEngine("")
++	if got := e.AgentLabelPrefix(); got != "" {
++		t.Errorf("AgentLabelPrefix() = %q, want empty", got)
++	}
++	e.reply(p, "ctx", "正文")
++	if len(p.sent) != 1 {
++		t.Fatalf("expected 1 sent message, got %d", len(p.sent))
++	}
++	if p.sent[0] != "正文" {
++		t.Errorf("unlabelled reply = %q, want %q", p.sent[0], "正文")
++	}
++}
++
++// TestAgentLabel_StampsReply covers the Reply choke point — the door almost
++// every user-visible message goes through.
++func TestAgentLabel_StampsReply(t *testing.T) {
++	e, p := makeLabelEngine("【WorkBuddy】")
++	e.reply(p, "ctx", "wb-ok")
++	if len(p.sent) != 1 {
++		t.Fatalf("expected 1 sent message, got %d", len(p.sent))
++	}
++	if want := "【WorkBuddy】wb-ok"; p.sent[0] != want {
++		t.Errorf("labelled reply = %q, want %q", p.sent[0], want)
++	}
++}
++
++// TestAgentLabel_StampsSend covers the Send choke point, which carries queue
++// notices, error notices and other non-Reply traffic.
++func TestAgentLabel_StampsSend(t *testing.T) {
++	e, p := makeLabelEngine("【DSH】")
++	if err := e.sendWithError(p, "ctx", "❌ 错误: 启动 Agent 会话失败"); err != nil {
++		t.Fatalf("sendWithError returned %v", err)
++	}
++	if len(p.sent) != 1 {
++		t.Fatalf("expected 1 sent message, got %d", len(p.sent))
++	}
++	if want := "【DSH】❌ 错误: 启动 Agent 会话失败"; p.sent[0] != want {
++		t.Errorf("labelled send = %q, want %q", p.sent[0], want)
++	}
++}
++
++// TestAgentLabel_EmptyContentUnchanged guards against a bare prefix being sent
++// when there is nothing to label (e.g. an empty reply suppressed downstream).
++func TestAgentLabel_EmptyContentUnchanged(t *testing.T) {
++	e, _ := makeLabelEngine("【WorkBuddy】")
++	if got := e.stampAgentLabel(""); got != "" {
++		t.Errorf("stampAgentLabel(\"\") = %q, want empty", got)
++	}
++}
++
++// TestAgentLabel_ReloadTakesEffect pins the /config reload contract: swapping
++// the display config must change what subsequent messages look like, and
++// clearing the label must restore the unlabelled form.
++func TestAgentLabel_ReloadTakesEffect(t *testing.T) {
++	e, p := makeLabelEngine("【DSH】")
++	e.SetDisplayConfig(DisplayCfg{AgentLabel: "【WorkBuddy】"})
++	e.reply(p, "ctx", "hi")
++	if want := "【WorkBuddy】hi"; p.sent[0] != want {
++		t.Errorf("after reload reply = %q, want %q", p.sent[0], want)
++	}
++
++	e.SetDisplayConfig(DisplayCfg{})
++	e.reply(p, "ctx", "hi")
++	if p.sent[1] != "hi" {
++		t.Errorf("after clearing reply = %q, want %q", p.sent[1], "hi")
++	}
++}
+diff --git a/core/mention_route_test.go b/core/mention_route_test.go
+new file mode 100644
+index 0000000..1587471
+--- /dev/null
++++ b/core/mention_route_test.go
+@@ -0,0 +1,520 @@
++package core
++
++import (
++	"go/ast"
++	"go/parser"
++	"go/token"
++	"reflect"
++	"strings"
++	"testing"
++)
++
++// gatedEngine builds an engine with the mention gate installed the same way
++// main.go does it for one project.
++func gatedEngine(self []string, peers map[string][]string, fallback string) *Engine {
++	e := &Engine{}
++	e.SetMentionRouting(self, peers, fallback)
++	return e
++}
++
++// standardClaudeEngine mirrors the real setup: the Claude bridge is gated,
++// and dsh / workbuddy are its peers (listed so their names are recognized).
++func standardClaudeEngine() *Engine {
++	return gatedEngine(
++		[]string{"@claude"},
++		map[string][]string{
++			"my-dsh":       {"@dsh"},
++			"my-workbuddy": {"@workbuddy"},
++		},
++		"answer",
++	)
++}
++
++func TestMentionGate_SingleMention(t *testing.T) {
++	e := standardClaudeEngine()
++
++	cases := []struct {
++		name    string
++		content string
++		want    string // expected "addressed" project; "" = do not drop
++	}{
++		{"names a peer", "@dsh 查一下磁盘", "my-dsh"},
++		{"names another peer", "@workbuddy 在吗", "my-workbuddy"},
++		{"names self", "@claude 帮我写个函数", ""},
++		{"names self with args", "@claude  @dsh 是谁", ""},
++		{"no mention at all", "普通消息，没有任何点名", ""},
++		{"peer name mid-sentence", "麻烦 @dsh 看一下", "my-dsh"},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			got, _ := e.mentionGateDrop(tc.content)
++			if got != tc.want {
++				t.Errorf("mentionGateDrop(%q) = %q, want %q", tc.content, got, tc.want)
++			}
++		})
++	}
++}
++
++// TestMentionGate_FirstMentionWins pins the positional rule. A set-based rule
++// ("drop whenever any peer alias appears") would silence both agents on a
++// message that names two of them, leaving the user with no reply at all.
++func TestMentionGate_FirstMentionWins(t *testing.T) {
++	e := standardClaudeEngine()
++
++	if got, tok := e.mentionGateDrop("@claude 帮我叫 @dsh 干活"); got != "" {
++		t.Errorf("self first must answer, got dropped by %q (token %q)", got, tok)
++	}
++	if got, _ := e.mentionGateDrop("@dsh 先看，@claude 再说"); got != "my-dsh" {
++		t.Errorf("peer first must drop, got %q", got)
++	}
++	if got, _ := e.mentionGateDrop("@workbuddy 别插话，然后 @dsh 上"); got != "my-workbuddy" {
++		t.Errorf("first of two peers must win, got %q", got)
++	}
++}
++
++func TestMentionGate_CaseInsensitive(t *testing.T) {
++	e := standardClaudeEngine()
++
++	for _, content := range []string{"@DSH 你好", "@Dsh 你好", "@dSh 你好"} {
++		if got, _ := e.mentionGateDrop(content); got != "my-dsh" {
++			t.Errorf("mentionGateDrop(%q) = %q, want my-dsh", content, got)
++		}
++	}
++	for _, content := range []string{"@CLAUDE 你好", "@Claude 你好"} {
++		if got, _ := e.mentionGateDrop(content); got != "" {
++			t.Errorf("mentionGateDrop(%q) = %q, want no drop", content, got)
++		}
++	}
++}
++
++// TestMentionGate_CJKAdjacent covers the reason the token scanner accepts CJK
++// characters: Chinese has no word separators, so "@dsh你好" arrives as one
++// run of characters and the alias "@dsh" has to match it as a prefix.
++func TestMentionGate_CJKAdjacent(t *testing.T) {
++	e := standardClaudeEngine()
++
++	if got, _ := e.mentionGateDrop("@dsh你好"); got != "my-dsh" {
++		t.Errorf("@dsh你好 should drop, got %q", got)
++	}
++	if got, _ := e.mentionGateDrop("@claude你好"); got != "" {
++		t.Errorf("@claude你好 should answer, got %q", got)
++	}
++	if got, _ := e.mentionGateDrop("@dsh，帮我看看"); got != "my-dsh" {
++		t.Errorf("@dsh，帮我看看 should drop, got %q", got)
++	}
++	if got, _ := e.mentionGateDrop("（@dsh）在吗"); got != "my-dsh" {
++		t.Errorf("（@dsh）在吗 should drop, got %q", got)
++	}
++}
++
++// TestMentionGate_EmailNotAMention guards the leading-boundary rule: an "@"
++// preceded by a name character belongs to an email address or handle, not to
++// an agent mention.
++func TestMentionGate_EmailNotAMention(t *testing.T) {
++	e := standardClaudeEngine()
++
++	for _, content := range []string{
++		"发给 a@dsh.com 试试",
++		"联系 x@claude.org",
++		"user@workbuddy.io",
++	} {
++		if got, _ := e.mentionGateDrop(content); got != "" {
++			t.Errorf("mentionGateDrop(%q) = %q, want no drop (email, not mention)", content, got)
++		}
++	}
++}
++
++// TestMentionGate_LongestAliasWins pins prefix resolution in both directions.
++func TestMentionGate_LongestAliasWins(t *testing.T) {
++	// Own alias is a PREFIX of the peer alias: the message addresses the peer.
++	ownShort := gatedEngine(
++		[]string{"@claude"},
++		map[string][]string{"peer": {"@claude-bot"}},
++		"answer",
++	)
++	if got, _ := ownShort.mentionGateDrop("@claude-bot 你好"); got != "peer" {
++		t.Errorf("longer peer alias must win, got %q (want peer)", got)
++	}
++	if got, _ := ownShort.mentionGateDrop("@claude 你好"); got != "" {
++		t.Errorf("@claude must be treated as self, got %q", got)
++	}
++
++	// Peer alias is a PREFIX of the own alias: the message addresses us.
++	peerShort := gatedEngine(
++		[]string{"@claude-bot"},
++		map[string][]string{"peer": {"@claude"}},
++		"answer",
++	)
++	if got, _ := peerShort.mentionGateDrop("@claude-bot 你好"); got != "" {
++		t.Errorf("longer own alias must win, got dropped by %q", got)
++	}
++	if got, _ := peerShort.mentionGateDrop("@claude 你好"); got != "peer" {
++		t.Errorf("@claude must be treated as peer, got %q", got)
++	}
++}
++
++// TestMentionGate_DisabledByDefault pins the zero-regression property: without
++// configuration the gate must never drop anything.
++func TestMentionGate_DisabledByDefault(t *testing.T) {
++	untouched := &Engine{}
++	if untouched.MentionGateEnabled() {
++		t.Error("gate must be off when SetMentionRouting was never called")
++	}
++	if got, _ := untouched.mentionGateDrop("@dsh 你好"); got != "" {
++		t.Errorf("ungated engine dropped a message (%q)", got)
++	}
++
++	// Explicitly installed but empty self list — also off.
++	emptySelf := &Engine{}
++	emptySelf.SetMentionRouting(nil, map[string][]string{"peer": {"@dsh"}}, "silent")
++	if emptySelf.MentionGateEnabled() {
++		t.Error("gate must be off with an empty self alias list")
++	}
++	if got, _ := emptySelf.mentionGateDrop("@dsh 你好"); got != "" {
++		t.Errorf("empty-self engine dropped a message (%q)", got)
++	}
++}
++
++func TestMentionGate_DefaultSilent(t *testing.T) {
++	e := gatedEngine(
++		[]string{"@claude"},
++		map[string][]string{"my-dsh": {"@dsh"}},
++		"silent",
++	)
++
++	if got, _ := e.mentionGateDrop("随便聊聊"); got != mentionUnaddressed {
++		t.Errorf("unaddressed message should drop under silent, got %q", got)
++	}
++	if got, _ := e.mentionGateDrop("@claude 你好"); got != "" {
++		t.Errorf("self mention must answer even under silent, got %q", got)
++	}
++	if got, _ := e.mentionGateDrop("@dsh 你好"); got != "my-dsh" {
++		t.Errorf("peer mention must drop under silent, got %q", got)
++	}
++}
++
++// TestMentionGate_AliasNormalization covers user-tolerant config: aliases may
++// be written with or without "@" and in any case.
++func TestMentionGate_AliasNormalization(t *testing.T) {
++	e := gatedEngine([]string{"claude"}, map[string][]string{"my-dsh": {"dsh"}}, "answer")
++
++	if got, _ := e.mentionGateDrop("@dsh 你好"); got != "my-dsh" {
++		t.Errorf("@dsh should drop, got %q", got)
++	}
++	if got, _ := e.mentionGateDrop("@claude 你好"); got != "" {
++		t.Errorf("@claude should answer, got %q", got)
++	}
++	if !e.MentionGateEnabled() {
++		t.Error("gate should be enabled after normalization")
++	}
++}
++
++// TestMentionGate_ReinstallOverwrites pins the /reload contract: a second
++// call replaces the previous policy instead of accumulating aliases.
++func TestMentionGate_ReinstallOverwrites(t *testing.T) {
++	e := standardClaudeEngine()
++
++	// Re-install with a different peer set: the old peers must be forgotten.
++	e.SetMentionRouting([]string{"@claude"}, map[string][]string{"other": {"@other"}}, "answer")
++
++	if got, _ := e.mentionGateDrop("@dsh 你好"); got != "" {
++		t.Errorf("stale peer alias still matched after reinstall: %q", got)
++	}
++	if got, _ := e.mentionGateDrop("@other 你好"); got != "other" {
++		t.Errorf("new peer alias not honored: %q", got)
++	}
++
++	// Clearing must fully disable the gate.
++	e.SetMentionRouting(nil, nil, "")
++	if e.MentionGateEnabled() {
++		t.Error("gate should be off after clearing")
++	}
++}
++
++func TestScanMentionTokens(t *testing.T) {
++	cases := []struct {
++		name string
++		in   string
++		want []string
++	}{
++		{"simple", "@dsh hi", []string{"@dsh"}},
++		{"lowercased", "@Dsh hi", []string{"@dsh"}},
++		{"two separated by space", "@dsh @claude", []string{"@dsh", "@claude"}},
++		{"two separated by comma", "@dsh,@claude", []string{"@dsh", "@claude"}},
++		{"cjk run merged", "@dsh你好", []string{"@dsh你好"}},
++		// The real messages this was built for arrived as "@dsh，你好" with a
++		// FULLWIDTH comma (U+FF0C) — the way a Chinese IME actually types it.
++		// Fullwidth punctuation must terminate the name, otherwise the token
++		// becomes "@dsh，你好" and matches no alias at all.
++		{"fullwidth comma", "@dsh，你好", []string{"@dsh"}},
++		{"fullwidth colon", "@claude：帮我", []string{"@claude"}},
++		{"fullwidth space", "@dsh　你好", []string{"@dsh"}},
++		{"ideographic full stop", "@dsh。", []string{"@dsh"}},
++		{"email skipped", "a@dsh.com", nil},
++		{"bare at skipped", "@ 空点名", nil},
++		{"at at end", "结尾的@", nil},
++		{"hyphen and underscore", "@my-agent_2 好", []string{"@my-agent_2"}},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			got := scanMentionTokens(tc.in)
++			if !reflect.DeepEqual(got, tc.want) {
++				t.Errorf("scanMentionTokens(%q) = %v, want %v", tc.in, got, tc.want)
++			}
++		})
++	}
++}
++
++func TestNormalizeMentionAliases(t *testing.T) {
++	got := normalizeMentionAliases([]string{" Claude ", "@CLAUDE", "@claude-code", "", "@", "cc"})
++	want := []string{"@claude-code", "@claude", "@cc"} // dedup + longest first
++
++	if !reflect.DeepEqual(got, want) {
++		t.Errorf("normalizeMentionAliases = %v, want %v", got, want)
++	}
++
++	if normalizeMentionAliases(nil) != nil {
++		t.Error("empty input should stay nil so the gate can detect 'not configured'")
++	}
++}
++
++// TestMentionGateBlocked covers the wrapper every delivery path calls —
++// handleMessage plus the synthetic injectors (cron, timer, heartbeat, webhook)
++// that never reach handleMessage. Those injectors are the reason the wrapper
++// exists: without it a scheduled prompt like "@dsh run the report" stored on
++// the Claude project would keep waking Claude on schedule.
++func TestMentionGateBlocked(t *testing.T) {
++	cases := []struct {
++		name     string
++		engine   *Engine
++		content  string
++		wantDrop bool
++	}{
++		{"gated: peer named", standardClaudeEngine(), "@dsh 查一下磁盘", true},
++		// Same thing the way it actually arrived over wechat: Chinese IME
++		// fullwidth comma, no space.
++		{"gated: peer + fullwidth comma", standardClaudeEngine(), "@dsh，你好", true},
++		{"gated: self + fullwidth comma", standardClaudeEngine(), "@claude，你好", false},
++		{"gated: self named", standardClaudeEngine(), "@claude 帮我写函数", false},
++		{"gated: nobody named", standardClaudeEngine(), "普通消息", false},
++		// A slash command is an instruction to THIS agent by construction, so
++		// it must survive even when its arguments name a peer.
++		{"gated: slash command naming peer", standardClaudeEngine(), "/cron list @dsh", false},
++		// Cron prompts are routinely written as TOML multi-line strings, so a
++		// leading newline/indent must not defeat the "/" exemption.
++		{"gated: indented slash command", standardClaudeEngine(), "\n  /report @dsh\n", false},
++		// No [[mention_agents]] entry => gate off => identical to pre-patch.
++		{"ungated engine ignores peer", gatedEngine(nil, nil, ""), "@dsh 查一下磁盘", false},
++		{"silent default: nobody named", gatedEngine([]string{"@claude"}, nil, "silent"), "普通消息", true},
++		{"silent default: self named", gatedEngine([]string{"@claude"}, nil, "silent"), "@claude 在吗", false},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			// The wrapper must never disagree with the underlying decision,
++			// apart from the "/" exemption it adds on top.
++			underlying := strings.HasPrefix(strings.TrimSpace(tc.content), "/")
++			peer, _ := tc.engine.mentionGateDrop(tc.content)
++			wantDrop := !underlying && peer != ""
++			if wantDrop != tc.wantDrop {
++				t.Fatalf("test case is inconsistent with mentionGateDrop: peer=%q", peer)
++			}
++
++			if got := tc.engine.mentionGateBlocked("test", tc.content, "wx:room:user", "tester"); got != tc.wantDrop {
++				t.Errorf("mentionGateBlocked(%q) = %v, want %v", tc.content, got, tc.wantDrop)
++			}
++		})
++	}
++}
++
++// TestMentionGateBlocked_NoSideEffects is a guard rail for future edits: the
++// wrapper is called before platforms are resolved and before sessions are
++// locked, so it must not mutate engine state in any way that changes the verdict
++// for a TEXT message. Calling it repeatedly must return the same answer every
++// time.
++//
++// It does have exactly one deliberate side effect — when a message names this
++// agent, the session's stickiness mark is refreshed so a follow-up caption-less
++// photo still lands here (see MentionSticky). That mark only influences messages
++// with no text at all; it must never alter the text-message verdict this test
++// pins down. The mark's own behaviour is covered by mention_sticky_test.go.
++func TestMentionGateBlocked_NoSideEffects(t *testing.T) {
++	e := standardClaudeEngine()
++
++	for i := 0; i < 3; i++ {
++		if !e.mentionGateBlocked("cron", "@dsh 干活", "wx:room:user", "cron") {
++			t.Fatalf("call %d: expected drop", i)
++		}
++		if e.mentionGateBlocked("cron", "@claude 干活", "wx:room:user", "cron") {
++			t.Fatalf("call %d: expected pass-through", i)
++		}
++	}
++
++	if !e.MentionGateEnabled() {
++		t.Error("gate must still be installed after repeated calls")
++	}
++}
++
++// ── Structural guard: no delivery path may silently skip the gate ───────────
++
++// TestMentionGate_EveryAgentEntryPointIsGated is a tripwire against silently
++// re-opening the bypass this whole feature exists to close.
++//
++// There is no single chokepoint. handleMessage serves live chat, while
++// ExecuteCronJob / ExecuteTimerJob / ExecuteHeartbeat / webhook inject
++// synthetic messages straight into processInteractiveMessageWith(). Missing
++// one is invisible: the feature looks like it works right up until that
++// particular path fires. That is exactly what happened while building this —
++// the gate went into handleMessage, the startup log dutifully printed
++// "mention gate enabled", and cron kept waking the agent anyway, burning
++// 65,874 input tokens per run.
++//
++// Code review does not reliably catch this class of bug, so parse the package
++// instead: every function that reaches an agent entry point must either call
++// mentionGateBlocked() or be listed in `allowed` with a stated reason.
++func TestMentionGate_EveryAgentEntryPointIsGated(t *testing.T) {
++	// Functions that eventually start an agent process.
++	entryPoints := map[string]bool{
++		"processInteractiveMessageWith": true,
++		"processInteractiveMessage":     true,
++	}
++
++	// Deliberate exceptions. Each needs a reason, so that a future ungated
++	// delivery path fails this test until it is either gated for real or
++	// consciously justified here.
++	allowed := map[string]string{
++		"processInteractiveMessage": "pure wrapper — its callers apply the gate",
++		"executeCustomCommand":      "user-invoked slash command, exempt via the \"/\" rule",
++		"executeSkill":              "user-invoked slash command, exempt via the \"/\" rule",
++	}
++
++	files := []string{"engine.go", "webhook.go"}
++	sites := 0
++
++	for _, path := range files {
++		fset := token.NewFileSet()
++		file, err := parser.ParseFile(fset, path, nil, 0)
++		if err != nil {
++			t.Fatalf("parse %s: %v", path, err)
++		}
++
++		for _, decl := range file.Decls {
++			fn, ok := decl.(*ast.FuncDecl)
++			if !ok || fn.Body == nil {
++				continue
++			}
++
++			label := fn.Name.Name
++			if fn.Recv != nil && len(fn.Recv.List) > 0 {
++				if recv := mentionTestReceiverName(fn.Recv.List[0].Type); recv != "" {
++					label = recv + "." + label
++				}
++			}
++
++			// mentionGateBlocksMessage also counts as a gate: it is the
++			// media-aware entry point, and it delegates to mentionGateBlocked
++			// for every message that carries text. Only the caption-less media
++			// case — a Weixin photo, which has no aliases to scan — is resolved
++			// separately. The delegation is asserted further down, so accepting
++			// this name here cannot become a loophole.
++			gates, calls := false, false
++			ast.Inspect(fn.Body, func(n ast.Node) bool {
++				call, ok := n.(*ast.CallExpr)
++				if !ok {
++					return true
++				}
++				name := mentionTestCalleeName(call.Fun)
++				switch name {
++				case "mentionGateBlocked", "mentionGateBlocksMessage":
++					gates = true
++				}
++				if entryPoints[name] {
++					calls = true
++				}
++				return true
++			})
++
++			if !calls {
++				continue
++			}
++			sites++
++			if gates {
++				continue
++			}
++			if _, ok := allowed[fn.Name.Name]; ok {
++				continue
++			}
++			t.Errorf("%s: %s() reaches an agent without a mention gate.\n"+
++				"    → add e.mentionGateBlocked(...) at the top of %s(), or list it in\n"+
++				"      the `allowed` map of this test together with a reason.",
++				path, label, fn.Name.Name)
++		}
++	}
++
++	// The media-aware wrapper must genuinely delegate. Without this assertion the
++	// exemption granted to mentionGateBlocksMessage above would let a future edit
++	// bypass the gate entirely while still looking gated to the scan.
++	{
++		fset := token.NewFileSet()
++		file, err := parser.ParseFile(fset, "engine.go", nil, 0)
++		if err != nil {
++			t.Fatalf("parse engine.go: %v", err)
++		}
++		delegates := false
++		for _, decl := range file.Decls {
++			fn, ok := decl.(*ast.FuncDecl)
++			if !ok || fn.Body == nil || fn.Name.Name != "mentionGateBlocksMessage" {
++				continue
++			}
++			ast.Inspect(fn.Body, func(n ast.Node) bool {
++				call, ok := n.(*ast.CallExpr)
++				if !ok {
++					return true
++				}
++				if mentionTestCalleeName(call.Fun) == "mentionGateBlocked" {
++					delegates = true
++				}
++				return true
++			})
++		}
++		if !delegates {
++			t.Error("mentionGateBlocksMessage() never delegates to mentionGateBlocked(); " +
++				"the exemption this test grants it would then hide an ungated path")
++		}
++	}
++
++	// If this trips, the parser or entryPoints map went stale — the test would
++	// otherwise pass vacuously and protect nothing.
++	if sites < 6 {
++		t.Errorf("only %d agent call sites inspected; expected at least 6 — "+
++			"is the entryPoints map out of date?", sites)
++	}
++}
++
++// mentionTestReceiverName renders a method receiver type as a bare identifier.
++func mentionTestReceiverName(expr ast.Expr) string {
++	switch t := expr.(type) {
++	case *ast.Ident:
++		return t.Name
++	case *ast.StarExpr:
++		return mentionTestReceiverName(t.X)
++	case *ast.IndexExpr: // generic receiver, e.g. Foo[T]
++		return mentionTestReceiverName(t.X)
++	}
++	return ""
++}
++
++// mentionTestCalleeName reduces the function part of a call to its bare name,
++// so `e.mentionGateBlocked`, `engine.mentionGateBlocked` and a plain
++// `mentionGateBlocked` all compare equal.
++func mentionTestCalleeName(expr ast.Expr) string {
++	switch t := expr.(type) {
++	case *ast.Ident:
++		return t.Name
++	case *ast.SelectorExpr:
++		return t.Sel.Name
++	}
++	return ""
++}
+diff --git a/core/mention_sticky_test.go b/core/mention_sticky_test.go
+new file mode 100644
+index 0000000..adb5e99
+--- /dev/null
++++ b/core/mention_sticky_test.go
+@@ -0,0 +1,358 @@
++package core
++
++import (
++	"reflect"
++	"sort"
++	"testing"
++	"time"
++)
++
++// ── Test harness ────────────────────────────────────────────
++//
++// A mentionCluster mirrors the real deployment: three projects, each with its
++// own engine and its own aliases, all sharing ONE stickiness registry. Routing
++// decisions only make sense at that level — a single engine cannot know what its
++// peers are called, so a per-engine test would not reproduce the bug being fixed.
++type mentionCluster struct {
++	sticky  *MentionSticky
++	engines map[string]*Engine
++}
++
++// aliasTable / fallbackTable reproduce this machine's live config.toml.
++var (
++	aliasTable = map[string][]string{
++		"my-project":   {"@claude"},
++		"my-dsh":       {"@dsh"},
++		"my-workbuddy": {"@wb"},
++	}
++	fallbackTable = map[string]string{
++		"my-project":   "answer",
++		"my-dsh":       "silent",
++		"my-workbuddy": "silent",
++	}
++)
++
++// newMentionCluster builds the trio. mediaOwner names the project configured with
++// media_default = true ("" = none configured).
++func newMentionCluster(ttl time.Duration, mediaOwner string) *mentionCluster {
++	sticky := NewMentionSticky(ttl)
++	engines := make(map[string]*Engine, len(aliasTable))
++	for name, self := range aliasTable {
++		peers := make(map[string][]string, len(aliasTable)-1)
++		for other, otherAliases := range aliasTable {
++			if other != name {
++				peers[other] = otherAliases
++			}
++		}
++		e := &Engine{name: name}
++		e.SetMentionRouting(self, peers, fallbackTable[name])
++		e.SetMentionSticky(sticky)
++		// Every engine is told the same target, exactly as main.go does it.
++		e.SetMentionMediaTarget(mediaOwner)
++		engines[name] = e
++	}
++	return &mentionCluster{sticky: sticky, engines: engines}
++}
++
++// deliver simulates one inbound Weixin message and returns the (sorted) names of
++// the projects that would actually process it.
++func (c *mentionCluster) deliver(content string, images int) []string {
++	msg := &Message{SessionKey: "weixin:dm:u1", UserName: "u1", Content: content}
++	for i := 0; i < images; i++ {
++		msg.Images = append(msg.Images, ImageAttachment{MimeType: "image/png"})
++	}
++	var winners []string
++	for name, e := range c.engines {
++		if !e.mentionGateBlocksMessage(msg) {
++			winners = append(winners, name)
++		}
++	}
++	sort.Strings(winners)
++	return winners
++}
++
++func assertDelivered(t *testing.T, got []string, want ...string) {
++	t.Helper()
++	sort.Strings(want)
++	if !reflect.DeepEqual(got, want) {
++		t.Errorf("delivered to %v, want %v", got, want)
++	}
++}
++
++// ── The bug this feature fixes ──────────────────────────────
++
++// TestBarePhoto_ReachesProjectAddressedJustBefore is the reproduction of the
++// reported problem and the contract for the fix.
++//
++// The Weixin client cannot attach a caption to a photo (the image preview screen
++// has no text box), so "@dsh look at this" and the photo necessarily arrive as
++// two messages. Before this fix the photo named nobody, matched default="silent",
++// and vanished — the user saw DSH "not reacting" to a picture it never received.
++func TestBarePhoto_ReachesProjectAddressedJustBefore(t *testing.T) {
++	c := newMentionCluster(time.Minute, "")
++
++	assertDelivered(t, c.deliver("@dsh 帮我看这张图", 0), "my-dsh")
++
++	// Same session, a moment later: the photo, with no text of any kind.
++	assertDelivered(t, c.deliver("", 1), "my-dsh")
++}
++
++// TestBarePhoto_SwitchingAddressee covers the natural follow-up: the user talks
++// to a different agent, and the next photo must follow that switch.
++func TestBarePhoto_SwitchingAddressee(t *testing.T) {
++	c := newMentionCluster(time.Minute, "")
++
++	assertDelivered(t, c.deliver("@dsh 看图", 0), "my-dsh")
++	assertDelivered(t, c.deliver("", 1), "my-dsh")
++
++	assertDelivered(t, c.deliver("@wb 也看一下", 0), "my-workbuddy")
++	assertDelivered(t, c.deliver("", 1), "my-workbuddy")
++}
++
++// TestBarePhoto_ExpiresWithTTL pins that stickiness is a short-lived hint, not a
++// permanent redirect: once it lapses, a photo goes back to being unaddressed.
++func TestBarePhoto_ExpiresWithTTL(t *testing.T) {
++	c := newMentionCluster(30*time.Millisecond, "")
++
++	assertDelivered(t, c.deliver("@dsh 看图", 0), "my-dsh")
++	time.Sleep(60 * time.Millisecond)
++
++	// Sticky mark is gone; my-project is the only project whose default lets an
++	// unaddressed message through.
++	assertDelivered(t, c.deliver("", 1), "my-project")
++}
++
++// ── media_default fallback ──────────────────────────────────
++
++// TestBarePhoto_MediaOwnerTakesUnaddressedMedia covers the configured fallback
++// for a photo sent without any prior alias.
++func TestBarePhoto_MediaOwnerTakesUnaddressedMedia(t *testing.T) {
++	c := newMentionCluster(time.Minute, "my-dsh")
++	assertDelivered(t, c.deliver("", 1), "my-dsh")
++}
++
++// TestBarePhoto_StickyBeatsMediaOwner pins the precedence order: a fresh alias
++// wins over the configured media owner, otherwise the user could never hand a
++// photo to a project other than the configured one.
++func TestBarePhoto_StickyBeatsMediaOwner(t *testing.T) {
++	c := newMentionCluster(time.Minute, "my-workbuddy")
++
++	assertDelivered(t, c.deliver("@dsh 看图", 0), "my-dsh")
++	assertDelivered(t, c.deliver("", 1), "my-dsh")
++}
++
++// TestBarePhoto_NoStickyNoOwnerKeepsOldBehaviour is the regression guard for
++// deployments that configure neither feature: a photo must behave exactly as it
++// did before, i.e. only default="answer" projects take it.
++func TestBarePhoto_NoStickyNoOwnerKeepsOldBehaviour(t *testing.T) {
++	c := newMentionCluster(time.Minute, "")
++	assertDelivered(t, c.deliver("", 1), "my-project")
++}
++
++// TestBareFileAndVoiceFollowThePhotoRules keeps the fix from being photo-only:
++// a caption-less PDF or voice note is the same shape of message.
++func TestBareFileAndVoiceFollowThePhotoRules(t *testing.T) {
++	c := newMentionCluster(time.Minute, "")
++
++	msg := &Message{SessionKey: "weixin:dm:u1", UserName: "u1"}
++	msg.Files = []FileAttachment{{MimeType: "application/pdf", FileName: "a.pdf"}}
++	if !bareMediaMessage(msg) {
++		t.Error("caption-less file should count as bare media")
++	}
++
++	voice := &Message{SessionKey: "weixin:dm:u1", UserName: "u1"}
++	voice.Audio = &AudioAttachment{MimeType: "audio/amr", Format: "amr"}
++	if !bareMediaMessage(voice) {
++		t.Error("caption-less voice note should count as bare media")
++	}
++
++	assertDelivered(t, c.deliver("@dsh 看这个文件", 0), "my-dsh")
++	assertDelivered(t, c.deliver("", 1), "my-dsh")
++}
++
++// ── Guards against over-reach ───────────────────────────────
++
++// TestTextMessages_AreUnaffectedByStickiness is the most important negative
++// guard: stickiness must change routing ONLY for caption-less attachments. A
++// text message that names a peer must still be dropped, even right after that
++// peer was addressed.
++func TestTextMessages_AreUnaffectedByStickiness(t *testing.T) {
++	c := newMentionCluster(time.Minute, "")
++
++	assertDelivered(t, c.deliver("@dsh 看图", 0), "my-dsh")
++
++	// Now name a peer in plain text. The sticky mark points at my-dsh, but a
++	// named message must follow the name, not the stickiness.
++	assertDelivered(t, c.deliver("@wb 你好", 0), "my-workbuddy")
++
++	// And a message naming the third project still reaches it.
++	assertDelivered(t, c.deliver("@claude 你好", 0), "my-project")
++}
++
++// TestUnaddressedText_DoesNotStealStickiness closes a subtle hole: my-project
++// runs with default="answer", so it accepts any unaddressed message. If that
++// acceptance registered stickiness, an offhand remark between "@dsh" and the
++// photo would hijack the photo.
++func TestUnaddressedText_DoesNotStealStickiness(t *testing.T) {
++	c := newMentionCluster(time.Minute, "")
++
++	assertDelivered(t, c.deliver("@dsh 帮我看图", 0), "my-dsh")
++
++	// An unaddressed aside — answered by my-project because its default is
++	// "answer" — must not become the session's addressee.
++	assertDelivered(t, c.deliver("今天天气不错", 0), "my-project")
++
++	// The photo must still go to DSH.
++	assertDelivered(t, c.deliver("", 1), "my-dsh")
++}
++
++// TestTextWithAttachment_IsNotBareMedia checks the classification boundary: a
++// photo WITH a caption is an ordinary addressed-or-not text message, and must
++// not be routed by stickiness.
++func TestTextWithAttachment_IsNotBareMedia(t *testing.T) {
++	msg := &Message{Content: "@wb 看一下这张图"}
++	msg.Images = []ImageAttachment{{MimeType: "image/png"}}
++	if bareMediaMessage(msg) {
++		t.Error("captioned photo must not count as bare media")
++	}
++
++	plain := &Message{Content: "你好"}
++	if bareMediaMessage(plain) {
++		t.Error("plain text must not count as bare media")
++	}
++
++	if bareMediaMessage(nil) {
++		t.Error("nil message must not count as bare media")
++	}
++
++	// Whitespace-only content is what some platforms send for a caption-less
++	// attachment, so it must still count as bare.
++	ws := &Message{Content: "   \n "}
++	ws.Images = []ImageAttachment{{MimeType: "image/png"}}
++	if !bareMediaMessage(ws) {
++		t.Error("whitespace-only content with an image should count as bare media")
++	}
++}
++
++// TestMentionsSelf_MatchesGatePositionalRule pins that the stickiness marker and
++// the gate agree on who was addressed. They use the same first-known-alias rule;
++// if they diverge, a message could be kept by the gate yet create no stickiness.
++func TestMentionsSelf_MatchesGatePositionalRule(t *testing.T) {
++	e := standardClaudeEngine()
++
++	cases := []struct {
++		content string
++		want    bool
++	}{
++		{"@claude 帮我写个函数", true},
++		{"@claude @dsh 是谁", true},   // self is first
++		{"@dsh @claude 是谁", false},  // peer is first, so the gate routes it away
++		{"麻烦 @claude 看一下", true},
++		{"普通消息，没有任何点名", false},
++		{"", false},
++	}
++
++	for _, tc := range cases {
++		if got := e.mentionsSelf(tc.content); got != tc.want {
++			t.Errorf("mentionsSelf(%q) = %v, want %v", tc.content, got, tc.want)
++		}
++		// Consistency: whenever mentionsSelf is true, the gate must keep it.
++		if tc.want {
++			if peer, _ := e.mentionGateDrop(tc.content); peer != "" {
++				t.Errorf("mentionsSelf(%q)=true but gate drops it as %q", tc.content, peer)
++			}
++		}
++	}
++}
++
++// ── Registry unit tests ─────────────────────────────────────
++
++func TestMentionSticky_MarkLookupForget(t *testing.T) {
++	s := NewMentionSticky(time.Minute)
++
++	if got := s.Lookup("sess"); got != "" {
++		t.Errorf("empty registry Lookup = %q, want empty", got)
++	}
++
++	s.Mark("sess", "my-dsh")
++	if got := s.Lookup("sess"); got != "my-dsh" {
++		t.Errorf("Lookup = %q, want my-dsh", got)
++	}
++
++	// Sessions are independent.
++	if got := s.Lookup("other"); got != "" {
++		t.Errorf("unrelated session Lookup = %q, want empty", got)
++	}
++
++	s.Forget("sess")
++	if got := s.Lookup("sess"); got != "" {
++		t.Errorf("after Forget Lookup = %q, want empty", got)
++	}
++}
++
++func TestMentionSticky_ZeroTTLFallsBackToDefault(t *testing.T) {
++	s := NewMentionSticky(0)
++	if s.TTL() != DefaultMentionStickyTTL {
++		t.Errorf("TTL() = %v, want %v", s.TTL(), DefaultMentionStickyTTL)
++	}
++	// A negative TTL must not mean "expires immediately" either.
++	if neg := NewMentionSticky(-time.Second); neg.TTL() != DefaultMentionStickyTTL {
++		t.Errorf("negative TTL = %v, want fallback", neg.TTL())
++	}
++}
++
++// TestMentionSticky_IgnoresEmptyInputs keeps a blank project name from creating a
++// mark that every engine would then compare against.
++func TestMentionSticky_IgnoresEmptyInputs(t *testing.T) {
++	s := NewMentionSticky(time.Minute)
++
++	s.Mark("", "my-dsh")
++	s.Mark("sess", "")
++
++	for _, key := range []string{"", "sess"} {
++		if got := s.Lookup(key); got != "" {
++			t.Errorf("Lookup(%q) = %q, want empty", key, got)
++		}
++	}
++}
++
++// TestMentionSticky_NilReceiverIsSafe: an engine that never had a registry
++// installed must not panic on the media path.
++func TestMentionSticky_NilReceiverIsSafe(t *testing.T) {
++	var s *MentionSticky
++	s.Mark("sess", "my-dsh")
++	if got := s.Lookup("sess"); got != "" {
++		t.Errorf("nil Lookup = %q, want empty", got)
++	}
++	s.Forget("sess")
++	if got := s.TTL(); got != 0 {
++		t.Errorf("nil TTL = %v, want 0", got)
++	}
++
++	// And an engine without a registry still routes media by the plain default.
++	e := &Engine{name: "my-dsh"}
++	e.SetMentionRouting([]string{"@dsh"}, nil, "silent")
++	if !e.mentionGateBlocksMessage(&Message{SessionKey: "s"}) {
++		t.Error("engine with no sticky registry and silent default should drop bare media")
++	}
++}
++
++// TestMediaRouteOwner_PeerOwnerDropsNotFallsThrough pins the distinction between
++// "claimed by a peer" and "unclaimed". If a peer owns the photo, this engine must
++// DROP rather than fall through to default="answer" and answer it anyway.
++func TestMediaRouteOwner_PeerOwnerDropsNotFallsThrough(t *testing.T) {
++	c := newMentionCluster(time.Minute, "")
++
++	// my-project has default="answer"; DSH is addressed first.
++	assertDelivered(t, c.deliver("@dsh 看图", 0), "my-dsh")
++
++	// The photo is claimed by my-dsh, so my-project must NOT take it despite its
++	// permissive default.
++	assertDelivered(t, c.deliver("", 1), "my-dsh")
++
++	// Direct check of the peer-owner branch.
++	e := c.engines["my-project"]
++	if claimed, mine, owner := e.mediaRouteOwner("weixin:dm:u1"); !claimed || mine || owner != "my-dsh" {
++		t.Errorf("mediaRouteOwner = (claimed=%v, mine=%v, owner=%q), want (true, false, my-dsh)", claimed, mine, owner)
++	}
++}
+diff --git a/core/queued_message_test.go b/core/queued_message_test.go
+new file mode 100644
+index 0000000..5e25038
+--- /dev/null
++++ b/core/queued_message_test.go
+@@ -0,0 +1,135 @@
++package core
++
++import (
++	"strings"
++	"testing"
++)
++
++// makeQueueNoticeEngine builds an engine configured the way main.go wires it:
++// a bare project label for message bodies, a queue capacity, and optional peers
++// for the mention gate.
++func makeQueueNoticeEngine(projectLabel string, maxQueued int, peers map[string][]string) (*Engine, *stubPlatformEngine) {
++	p := &stubPlatformEngine{n: "test"}
++	e := NewEngine("my-workbuddy", &stubAgent{}, []Platform{p}, "", LangChinese)
++	e.SetDisplayConfig(DisplayCfg{ProjectLabel: projectLabel})
++	e.maxQueuedMessages = maxQueued
++	e.SetMentionRouting([]string{"@wb"}, peers, "silent")
++	return e, p
++}
++
++// TestQueuedMessage_FullDetail is the contract the user asked for: the queue
++// notice must say WHERE the message landed, WHO is holding the session, and WHO
++// will eventually run it — not just "received".
++func TestQueuedMessage_FullDetail(t *testing.T) {
++	e, _ := makeQueueNoticeEngine("WorkBuddy", 5, map[string][]string{
++		"my-project": {"@claude"},
++		"my-dsh":     {"@dsh"},
++	})
++	got := e.queuedMessageConfirmation(1)
++
++	for _, want := range []string{"📬", "第 1/5 位", "WorkBuddy", "@claude", "@dsh"} {
++		if !strings.Contains(got, want) {
++			t.Errorf("queue notice missing %q\n--- got ---\n%s", want, got)
++		}
++	}
++}
++
++// TestQueuedMessage_KeepsBaseSentence protects the existing contract asserted by
++// engine_test.go: the original sentence must still be present verbatim, because
++// other tests (and users' muscle memory) match on it.
++func TestQueuedMessage_KeepsBaseSentence(t *testing.T) {
++	e, _ := makeQueueNoticeEngine("WorkBuddy", 5, nil)
++	got := e.queuedMessageConfirmation(1)
++	if !strings.HasPrefix(got, e.i18n.T(MsgMessageQueued)) {
++		t.Errorf("queue notice must start with the base sentence\n--- got ---\n%s", got)
++	}
++}
++
++// TestQueuedMessage_NoPeersOmitsReroute pins that the redirect hint is dropped
++// rather than rendered empty when there is nobody to redirect to.
++func TestQueuedMessage_NoPeersOmitsReroute(t *testing.T) {
++	e, _ := makeQueueNoticeEngine("WorkBuddy", 5, nil)
++	got := e.queuedMessageConfirmation(1)
++	if strings.Contains(got, "改派") {
++		t.Errorf("expected no reroute hint without peers\n--- got ---\n%s", got)
++	}
++	if strings.Contains(got, "%!") {
++		t.Errorf("format verb left unrendered\n--- got ---\n%s", got)
++	}
++}
++
++// TestQueuedMessage_FallsBackToProjectName covers the unlabelled deployment: an
++// operator who never sets `label` must still see a readable agent name.
++func TestQueuedMessage_FallsBackToProjectName(t *testing.T) {
++	e, _ := makeQueueNoticeEngine("", 5, nil)
++	got := e.queuedMessageConfirmation(2)
++	if !strings.Contains(got, "my-workbuddy") {
++		t.Errorf("expected fallback to project name\n--- got ---\n%s", got)
++	}
++}
++
++// TestQueuedMessage_ExposesDepth guards the numbers themselves: position and
++// capacity must track the real values, not a hard-coded pair.
++func TestQueuedMessage_ExposesDepth(t *testing.T) {
++	e, _ := makeQueueNoticeEngine("WorkBuddy", 8, nil)
++	if got := e.queuedMessageConfirmation(3); !strings.Contains(got, "第 3/8 位") {
++		t.Errorf("expected position 3/8\n--- got ---\n%s", got)
++	}
++}
++
++// TestFailedToStartSession_NamesAgent is the second half of the request: when
++// session startup fails the user must be told WHICH agent broke.
++func TestFailedToStartSession_NamesAgent(t *testing.T) {
++	e, _ := makeQueueNoticeEngine("DSH", 5, nil)
++	got := e.failedToStartSessionNotice()
++
++	if !strings.HasPrefix(got, e.i18n.T(MsgFailedToStartAgentSession)) {
++		t.Errorf("must start with the base error sentence\n--- got ---\n%s", got)
++	}
++	if !strings.Contains(got, "DSH") {
++		t.Errorf("error notice must name the failing agent\n--- got ---\n%s", got)
++	}
++	if !strings.Contains(got, "/stop") {
++		t.Errorf("error notice should carry the recovery hint\n--- got ---\n%s", got)
++	}
++}
++
++// TestFailedToStartSession_FallsBackToProjectName mirrors the queue-notice
++// fallback so an unlabelled project is never left with a blank agent name.
++func TestFailedToStartSession_FallsBackToProjectName(t *testing.T) {
++	e, _ := makeQueueNoticeEngine("", 5, nil)
++	if got := e.failedToStartSessionNotice(); !strings.Contains(got, "my-workbuddy") {
++		t.Errorf("expected fallback to project name\n--- got ---\n%s", got)
++	}
++}
++
++// TestQueueDetailMessages_AllLanguagesComplete is a translation-completeness
++// guard: every language must define the new strings AND carry the same number of
++// format verbs. A missing Spanish row or a mistyped %d would otherwise surface
++// only as "%!d(MISSING)" in a user's chat window.
++func TestQueueDetailMessages_AllLanguagesComplete(t *testing.T) {
++	langs := []Language{LangEnglish, LangChinese, LangTraditionalChinese, LangJapanese, LangSpanish}
++	cases := map[MsgKey]int{
++		MsgMessageQueuedDetail:      4,
++		MsgMessageQueuedReroute:     1,
++		MsgFailedToStartSessionWhom: 1,
++	}
++
++	for key, wantVerbs := range cases {
++		entry, ok := messages[key]
++		if !ok {
++			t.Errorf("missing message key %q", key)
++			continue
++		}
++		for _, lang := range langs {
++			text, ok := entry[lang]
++			if !ok || strings.TrimSpace(text) == "" {
++				t.Errorf("%s: language %q missing", key, lang)
++				continue
++			}
++			if got := strings.Count(text, "%"); got != wantVerbs {
++				t.Errorf("%s[%s]: has %d format verbs, want %d (%q)", key, lang, got, wantVerbs, text)
++			}
++		}
++	}
++}
+-- 
+2.55.0.windows.3
+

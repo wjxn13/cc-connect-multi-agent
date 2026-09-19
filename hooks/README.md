@@ -84,6 +84,27 @@ python scripts/l2_hook_tests.py
 想验证「真的拦住了」，判据不是钩子自己的日志，而是**读 agent 侧的会话记录**：
 DSH 看 `hook/result` 事件（`{exitCode, decision}`）+ 同轮 `request/header` 是否为 0。
 
+## 排查用：启动探针
+
+脚本在**读 stdin 之前**会往 `l2-hook-start.jsonl` 追加一行（与正式日志分开，
+免得污染「`l2-hook.jsonl` 行数」这个实验口径）。它把两种可能一刀切开：
+
+| 探针出现了吗 | 含义 | 该往哪查 |
+|---|---|---|
+| **没有** | 平台**压根没执行**这条 hook | 配置 / 信任 / 启动方式 |
+| **出现了** | 执行了，但卡在 stdin 或 JSON 解析 | hook 协议 |
+
+行里同时记了 `agent`（`--agent` 或 `CC_BRIDGE_AGENT` 报出的平台）、`gated`
+（`CC_BRIDGE_L2` 是否 =1）、`pid`、`stdinIsTTY`。三个 agent 共用这份脚本时，
+这一行还能直接回答「谁真的调了 hook、谁没调」。
+
+> ⚠️ `gated=False` **不代表配错了**：`workbuddy` / `dsh` 两家的 `requireGate` 本来就是 `false`
+> ——它们的钩子只注入给桥接进程，天然隔离，再加门控反而会因 env 漏配而**静默失效**。
+> 只有挂在**全局** settings 里的 `claudecode` 需要 `true`。详见 `docs/07` 第五节。
+
+日志默认落在 `~/.cc-connect/logs/`（用 `os.homedir()` 取，**不写死用户名**，方便换机器复现），
+可用 `CC_BRIDGE_L2_LOG` / `CC_BRIDGE_L2_START_LOG` 覆盖。
+
 ## 平台分支速查
 
 | 平台 | 有效阻断写法 | 备注 |
@@ -93,3 +114,7 @@ DSH 看 `hook/result` 事件（`{exitCode, decision}`）+ 同轮 `request/header
 | DSH | stdout `{"decision":"block"}` | `exit 2` 在 Windows 上被 PowerShell 改写成 1；`{"continue":false}` 完全不阻断 |
 
 完整机理与实测报文见 `docs/06-L2前置拦截-三平台落地报告.md`。
+
+> **本层（L2）在整体中的位置**：现在共有三道防线，L2 是第二道。比它更早的是**引擎层点名关卡（L1）**，
+> 比它更晚的是**输出静默约定（L3）**。三者是**叠加**关系，L1 落地后 L2 并未被取代——
+> 详见 `docs/07-点名路由与三层防线-落地报告.md` 第五节。

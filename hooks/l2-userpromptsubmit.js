@@ -29,6 +29,48 @@ const LOG = process.env.CC_BRIDGE_L2_LOG
   || path.join(os.homedir(), '.cc-connect', 'logs', 'l2-hook.jsonl');
 const GATE_VAR = 'CC_BRIDGE_L2';
 
+// ── 启动探针（2026-09-18 加）────────────────────────────────────────────────
+// 目的：一刀切开「hook 根本没被调用」与「被调用了但卡在 stdin / 解析」两种可能。
+//
+// 背景：桥接链路的 claudecode 在正式日志 `l2-hook.jsonl` 里长期零记录，
+//       而脚本本体已被证明是好的（手动喂 stdin 能正常 block + 写日志）。
+//       于是只剩两种解释，且它们对排查方向的意义完全相反：
+//         (a) Claude Code 压根没执行这条 hook  → 得从「配置/信任/启动方式」入手
+//         (b) 执行了，但 stdin 迟迟不 end（或 JSON 结构不符）→ 得从「hook 协议」入手
+//       下面这条记录写在**任何 stdin 操作之前**，所以它出现 = (b)，不出现 = (a)。
+//
+// 为什么单独一个文件：正式日志 `l2-hook.jsonl` 的行数一直被当作实验口径
+//       （「215 → 215 零增长」），不能掺入噪音行，否则历史对比失效。
+//
+// 顺带价值：三个 agent 共用本脚本，这一行还能显示「谁真的调了 hook、谁没调」。
+const START_LOG = process.env.CC_BRIDGE_L2_START_LOG
+  || path.join(os.homedir(), '.cc-connect', 'logs', 'l2-hook-start.jsonl');
+try {
+  const argAgent = (() => {
+    const i = process.argv.indexOf('--agent');
+    if (i >= 0 && process.argv[i + 1]) return process.argv[i + 1];
+    const eq = process.argv.find((a) => a.startsWith('--agent='));
+    return eq ? eq.slice('--agent='.length) : '(未指定)';
+  })();
+  fs.appendFileSync(
+    START_LOG,
+    JSON.stringify({
+      ts: new Date().toISOString(),
+      phase: 'start',
+      agent: argAgent,
+      envAgent: process.env.CC_BRIDGE_AGENT || null,
+      gated: process.env[GATE_VAR] === '1',
+      pid: process.pid,
+      cwd: process.cwd(),
+      stdinIsTTY: !!process.stdin.isTTY,
+      argvRaw: process.argv.slice(2).join(' '),
+    }) + '\n',
+    'utf8'
+  );
+} catch (_) {
+  // 探针失败绝不能影响主流程
+}
+
 // ── 平台档案 ────────────────────────────────────────────────────────────────
 // others       : 「点名了别人」的前缀正则。负向先行断言 (?![a-z0-9_]) 避免把
 //                "@dshx" 之类误判成点名。
