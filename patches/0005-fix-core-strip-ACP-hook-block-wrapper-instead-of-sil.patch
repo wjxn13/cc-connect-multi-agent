@@ -1,5 +1,5 @@
 From f3d66d44f2898a7c807dbecc860e2992d8dc2d27 Mon Sep 17 00:00:00 2001
-From: wjxn13 <yqyj33@qq.com>
+From: wjxn13 <236573882+wjxn13@users.noreply.github.com>
 Date: Wed, 16 Sep 2026 22:31:17 +0800
 Subject: [PATCH 5/6] fix(core): strip ACP hook-block wrapper instead of
  silencing the whole reply

@@ -1,5 +1,5 @@
 From 1effa55612116f549e4215a35f86048a0e0d729f Mon Sep 17 00:00:00 2001
-From: wjxn13 <yqyj33@qq.com>
+From: wjxn13 <236573882+wjxn13@users.noreply.github.com>
 Date: Tue, 15 Sep 2026 20:23:11 +0800
 Subject: [PATCH 1/6] feat(core): silence Claude Code hook-block result text
 

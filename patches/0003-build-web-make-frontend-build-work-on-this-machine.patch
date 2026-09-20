@@ -1,5 +1,5 @@
 From b5ce849d3b6498497652e2bced8cc87ef5427f10 Mon Sep 17 00:00:00 2001
-From: wjxn13 <yqyj33@qq.com>
+From: wjxn13 <236573882+wjxn13@users.noreply.github.com>
 Date: Tue, 15 Sep 2026 21:01:46 +0800
 Subject: [PATCH 3/6] build(web): make frontend build work on this machine
 

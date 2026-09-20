@@ -1,5 +1,5 @@
 From b686e4d7f75c3e83446a636ab14921ea9632da60 Mon Sep 17 00:00:00 2001
-From: wjxn13 <yqyj33@qq.com>
+From: wjxn13 <236573882+wjxn13@users.noreply.github.com>
 Date: Tue, 15 Sep 2026 20:27:09 +0800
 Subject: [PATCH 2/6] test(core): add engine-path and reverse-control coverage
  for hook-block silence
