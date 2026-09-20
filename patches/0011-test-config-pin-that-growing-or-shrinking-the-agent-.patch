@@ -1,0 +1,158 @@
+From 232b71eae05a02cbe93052fae118cf44e6738fe7 Mon Sep 17 00:00:00 2001
+From: wjxn13 <236573882+wjxn13@users.noreply.github.com>
+Date: Sun, 20 Sep 2026 12:52:57 +0800
+Subject: [PATCH] test(config): pin that growing or shrinking the agent table
+ stays valid
+
+The gate is deliberately name-keyed: mentionRoutingFor() re-derives the
+peer table from whatever [[mention_agents]] entries exist, so adding or
+removing an agent is a pure config edit with no code to touch. Nothing
+stores a peer list, a count, or an index.
+
+These cases lock that in, and double as the guard rail for a later
+upgrade: if a future version starts assuming 'exactly three agents', a
+fixed peer list, or 'exactly one answer default', the test fails instead
+of the deployment.
+
+Also pins two looser-than-documented behaviours so they are explicit
+rather than a surprise: a project listed in [[projects]] but absent from
+[[mention_agents]] is valid (gate simply off for it), and a second
+media_default = true is accepted although mentionMediaTargetFor() only
+ever honours the first.
+---
+ config/mention_agents_scale_test.go | 123 ++++++++++++++++++++++++++++
+ 1 file changed, 123 insertions(+)
+ create mode 100644 config/mention_agents_scale_test.go
+
+diff --git a/config/mention_agents_scale_test.go b/config/mention_agents_scale_test.go
+new file mode 100644
+index 0000000..49ab494
+--- /dev/null
++++ b/config/mention_agents_scale_test.go
+@@ -0,0 +1,123 @@
++package config
++
++import (
++	"fmt"
++	"strings"
++	"testing"
++)
++
++// TestMentionAgents_ScalesWithAgentCount pins the property that makes the gate
++// cheap to grow: the [[mention_agents]] table is validated against [[projects]]
++// by NAME, so adding or removing an agent is a pure config edit. Nothing in the
++// code stores a peer list, a count, or an index — mentionRoutingFor() re-derives
++// the peer table from whatever entries exist.
++//
++// These cases are the guard rail for a later upgrade: if a future version starts
++// assuming "exactly three agents", a fixed peer list, or "exactly one answer
++// default", this test fails instead of the deployment.
++func TestMentionAgents_ScalesWithAgentCount(t *testing.T) {
++	yes := func() *bool { b := true; return &b }
++
++	// build returns a config with n projects, each registered as a gated agent.
++	build := func(n int, mutate func(*Config)) *Config {
++		c := &Config{}
++		for i := 0; i < n; i++ {
++			name := fmt.Sprintf("agent%d", i)
++			c.Projects = append(c.Projects, validProject(name))
++			c.MentionAgents = append(c.MentionAgents, MentionAgentConfig{
++				Project: name,
++				Aliases: []string{"@" + name},
++				Enabled: yes(),
++				Default: "silent",
++			})
++		}
++		if mutate != nil {
++			mutate(c)
++		}
++		return c
++	}
++
++	cases := []struct {
++		name    string
++		cfg     *Config
++		wantErr string
++	}{
++		// ── adding / removing an agent must stay valid ──────────────
++		{"one agent", build(1, nil), ""},
++		{"two agents", build(2, nil), ""},
++		{"three agents (deployed shape)", build(3, nil), ""},
++		{"four agents (one added)", build(4, nil), ""},
++		{"six agents (several added)", build(6, nil), ""},
++		{"two agents (one removed)", build(2, nil), ""},
++		{"whole table omitted", build(3, func(c *Config) { c.MentionAgents = nil }), ""},
++
++		// A project with no [[mention_agents]] entry keeps working: the gate is
++		// simply off for it (mentionRoutingFor returns gated = false). Adding a
++		// [[projects]] first and registering it later is therefore safe.
++		{"project not yet registered as agent", build(3, func(c *Config) {
++			c.MentionAgents = c.MentionAgents[:2]
++		}), ""},
++
++		// ── the fallback action is free-form, not a singleton ──────
++		// Several projects may answer by default; only "answer"/"silent"/"" are
++		// legal values. Nothing requires exactly one "answer".
++		{"two projects default to answer", build(3, func(c *Config) {
++			c.MentionAgents[0].Default = "answer"
++			c.MentionAgents[1].Default = "answer"
++		}), ""},
++		{"default omitted falls back to answer", build(3, func(c *Config) {
++			c.MentionAgents[1].Default = ""
++		}), ""},
++
++		// ── media_default is documented as "exactly one" but NOT enforced ──
++		// mentionMediaTargetFor() returns the FIRST match in file order, so a
++		// second one is silently ignored. Pinned as accepted-here so the
++		// looser-than-documented behaviour is explicit rather than a surprise.
++		{"two media_default flags are accepted", build(3, func(c *Config) {
++			c.MentionAgents[0].MediaDefault = yes()
++			c.MentionAgents[1].MediaDefault = yes()
++		}), ""},
++
++		// ── the checks that DO bite when growing the table ─────────
++		{"two projects claim the same alias", build(3, func(c *Config) {
++			c.MentionAgents[1].Aliases = []string{"@agent0"}
++		}), "claimed by both"},
++		{"entry names an unregistered project", build(3, func(c *Config) {
++			c.MentionAgents = append(c.MentionAgents, MentionAgentConfig{
++				Project: "ghost", Aliases: []string{"@ghost"}, Enabled: yes(),
++			})
++		}), "does not match any [[projects]] name"},
++		{"same project registered twice", build(3, func(c *Config) {
++			c.MentionAgents[1].Project = c.MentionAgents[0].Project
++			c.MentionAgents[1].Aliases = []string{"@dup"}
++			c.MentionAgents = append(c.MentionAgents[:1], c.MentionAgents[2:]...)
++			c.MentionAgents = append(c.MentionAgents, MentionAgentConfig{
++				Project: "agent0", Aliases: []string{"@again"}, Enabled: yes(),
++			})
++		}), "declared more than once"},
++		{"agent without any alias", build(3, func(c *Config) {
++			c.MentionAgents[1].Aliases = nil
++		}), "needs at least one non-empty alias"},
++		{"illegal default value", build(3, func(c *Config) {
++			c.MentionAgents[1].Default = "maybe"
++		}), `default must be "answer" or "silent"`},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			err := tc.cfg.validate()
++			if tc.wantErr == "" {
++				if err != nil {
++					t.Fatalf("adding/removing an agent must stay valid, got: %v", err)
++				}
++				return
++			}
++			if err == nil {
++				t.Fatalf("want error containing %q, got nil", tc.wantErr)
++			}
++			if !strings.Contains(err.Error(), tc.wantErr) {
++				t.Fatalf("error = %q, want substring %q", err.Error(), tc.wantErr)
++			}
++		})
++	}
++}
+-- 
+2.55.0.windows.3
+

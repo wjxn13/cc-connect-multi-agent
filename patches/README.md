@@ -5,7 +5,7 @@
 
 | 组 | 补丁 | 解决什么 | 位置 |
 |---|---|---|---|
-| **A. 点名路由** | `0007` – `0010` | 让「@ 了谁」决定消息进哪个 agent | **L1**，消息进 agent **之前** |
+| **A. 点名路由** | `0007` – `0011` | 让「@ 了谁」决定消息进哪个 agent | **L1**，消息进 agent **之前** |
 | **B. hook-block 静默** | `0001` – `0006` | 让「被前置钩子拦掉」的回合不要漏出空响应/包装文本 | **L2 的配套**，模型调用**之前**拦、拦完**输出**要干净 |
 
 两组**互不依赖，可单独套用**：
@@ -19,7 +19,7 @@
 
 ---
 
-# A 组：点名路由（0007 – 0010）
+# A 组：点名路由（0007 – 0011）
 
 ## 为什么需要
 
@@ -46,6 +46,7 @@
 | `0008` | `test(core): cover mention routing, agent labels and queued messages` | 离线测试（+1176 行），内容全部是新增的 `_test.go` |
 | `0009` | `feat(core): broadcast a leading run of mentions to every named agent` | **多点名广播（2026-09-20）**：句首连着写多个 `@` 时段内每个被点名的 project 都放行；`MentionSticky` 由「记一个」改「记一组」，后续裸图片归全部被点名者 |
 | `0010` | `test(core): cover multi-mention broadcast and set-based sticky routing` | 多播与多 owner 粘性的测试；并把测试夹具的 `default` 表同步到当天实际配置（默认应答者 claude → wb） |
+| `0011` | `test(config): pin that growing or shrinking the agent table stays valid` | **扩缩容护栏**：1 / 2 / 3 / 4 / 6 个 agent、整表去掉、某 project 未登记 —— 全部必须通过校验；同时把两处「比文档宽松」的行为钉死（未登记的 project 合法、第二个 `media_default` 被静默忽略） |
 
 ### `0007` 具体改了什么
 
@@ -102,11 +103,13 @@
   mention gate: media message dropped project=my-project   token=(media)
   ```
 
-- ✅ 多点名（`0009`/`0010`，2026-09-20）：点名相关测试全绿
-  （`go test ./core/ -run 'TestMention|TestScanMention|TestNormalizeMention|TestBarePhoto|TestMediaRoute'`；
-  全包仅剩 2 个与 Windows 路径/符号链接有关的**既有**失败，与本功能无关）。
+- ✅ 多点名与扩缩容（`0009`/`0010`/`0011`，2026-09-20）：点名相关测试全绿
+  （`go test ./core/ -run 'TestMention|TestScanMention|TestNormalizeMention|TestBarePhoto|TestMediaRoute|TestSticky'`
+  ＋ `go test ./config/ -run 'TestMention|TestAlias|TestLabel'`）。
+  全包仅剩 5 个与 Windows 环境有关的**既有**失败（`HOME` 取值、路径分隔符、`t.TempDir()` 清理时句柄未释放），
+  在干净 HEAD 上同样失败，与本功能无关 —— 详见 `docs/09` 第 6 节。
   部署 `v1.3.4+mention.multicast` 并重启，启动日志三个 project 的 `mention gate enabled`
-  及 `default` / `media_default` 全部正确。微信端到端（真人发 `@wb @dsh …`）待实测记录。
+  及 `default` / `media_default` 全部正确。微信端到端已实测三轮通过。
 
 - ⚠️ **对上游 `main` 不能直接应用**（`0007` 在 `core/engine.go` 首个 hunk 冲突）。
   `0001`–`0006` 在上游 `main` 上仍然 6/6 干净，只有 A 组需要 rebase。
@@ -178,7 +181,8 @@ git am /path/to/patches/*.patch
 ```bash
 # 只要点名路由
 git am /path/to/patches/0007-*.patch /path/to/patches/0008-*.patch \
-       /path/to/patches/0009-*.patch /path/to/patches/0010-*.patch
+       /path/to/patches/0009-*.patch /path/to/patches/0010-*.patch \
+       /path/to/patches/0011-*.patch
 
 # 只要 hook-block 静默（跳过仅本机需要的 0003）
 git am /path/to/patches/0001-*.patch /path/to/patches/0002-*.patch \
@@ -202,8 +206,8 @@ go build -ldflags "-s -w -X main.version=v1.3.4" -o cc-connect.exe ./cmd/cc-conn
 
 | 项 | 结果 |
 |---|---|
-| 对基线 `v1.3.4` 完整 `git am` | ✅ `0001`–`0010` 全部干净应用 |
-| 对上游 `main`（tip `757b4df`，2026-09-10） | ⚠️ `0001`–`0006` **6/6 干净**；`0007`–`0010` **需 rebase** |
+| 对基线 `v1.3.4`（`27c1de8`）完整 `git am` | ✅ `0001`–`0011` **11/11 全部干净应用**；应用后的树哈希 `05aa505b` 与主线 **逐字节一致**（2026-09-20 实测） |
+| 对上游 `main`（tip `757b4df`，2026-09-10） | ⚠️ `0001`–`0006` **6/6 干净**；`0007`–`0011` **需 rebase** |
 | A 组应用结果的正确性 | ✅ 与主线提交逐字节一致；编译 + 单测通过 |
 | B 组相关单测 | ✅ `go test ./core/ -run 'TestProcessInteractiveEvents_(HookBlocked|EmptyResponse)'` |
 

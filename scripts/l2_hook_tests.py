@@ -7,9 +7,15 @@ L2 钩子（l2-userpromptsubmit.js）回归测试 —— 多平台版。
   ② 拦截理由里必须写**实际**被点名的那个 agent；
   ③ WorkBuddy / DSH 的 reason 必须**恰好**是 NO_REPLY —— 多一个字就会原样发到微信，
      这是最容易被后续改动悄悄破坏的一条，必须用测试钉死；
-  ④ DSH 的 payload.prompt 有时带 <system-reminder> 注入块前缀，而点名正则是开头锚定
-     （^@xxx）→ 不剥掉就会**漏拦**（模型照跑、token 白花）。stripLeadingSystemReminder
-     是专治这条的，必须有回归用例。
+  ④ DSH 的 payload.prompt 有时带 <system-reminder> 注入块前缀，而点名判定只看
+     **句首**那一串 → 不剥掉前缀就等价于「消息不以 @ 开头」→ **漏拦**
+     （模型照跑、token 白花）。stripLeadingSystemReminder 是专治这条的，
+     必须有回归用例。
+  ⑤ 语义是「句首一连串 @ 全算被点名」（2026-09-20 起，见 L1 的 scanLeadingMentionRun）。
+     钩子有**自己独立的一份**同类解析，两边必须永远一致 —— 下面的「多点名广播」
+     一节就是这条的回归用例。改判定规则时，L1（core/engine.go）、本钩子、
+     以及 4 份规则文字必须同时改；只改 L1 会出现「关卡日志显示已放行、
+     agent 也 turn complete，但用户什么都收不到」的静默故障。
 
 判据（三家写法不同，见脚本内的 PLATFORM 说明）。
 
@@ -72,6 +78,26 @@ CASES = [
      True, "NO_REPLY"),
     ("dsh", "正文中间出现不算前缀",      True,
      "先看这个 <system-reminder>x</system-reminder> @claude",        False, None),
+
+    # ── 多点名广播（2026-09-20 起）：句首那一串 @ 里的人**全都**被点名 ──
+    #    判据：段内有自己 → 放行（自己也该答）；段内只有别人 → 拦。
+    #    ⚠️ 反直觉但正确的一例：`@dsh @claude 是谁` 对 Claude 是**放行**，
+    #       因为句首段里含 @claude 自己 —— 多播语义下自己也被点名了。
+    ("claudecode", "多播：他+我 → 放行",   True,  "@dsh @claude 是谁",   False, None),
+    ("claudecode", "多播：只有他 → 拦",    True,  "@dsh @workbuddy 开会", True,  "点名了 @dsh"),
+    ("claudecode", "多播：全角逗号分隔",    True,  "@dsh，@claude 帮我",   False, None),
+    ("claudecode", "多播：顿号分隔",        True,  "@wb、@dsh 你们看",     True,  "点名了 @wb"),
+    ("claudecode", "多播：加号分隔",        True,  "@wb+@dsh 排一下",      True,  "点名了 @wb"),
+    ("claudecode", "多播：全角空格分隔",    True,  "@wb　@dsh 排一下",     True,  "点名了 @wb"),
+    ("claudecode", "段外点名不算多播",      True,  "@dsh 你好 @claude",    True,  "点名了 @dsh"),
+    ("claudecode", "裸 @ 终止整段",        True,  "@dsh @ @claude 你好",  True,  "点名了 @dsh"),
+    ("claudecode", "无分隔符不算多播",      True,  "@dsh@claude 你好",     True,  "点名了 @dsh"),
+    ("claudecode", "缩进后仍算句首段",      True,  "   @dsh @claude 你好", False, None),
+    ("dsh", "多播：他+我 → 放行",          True,  "@claude @dsh 是谁",    False, None),
+    ("dsh", "多播：只有他 → 拦",           True,  "@claude @wb 看着办",   True,  "NO_REPLY"),
+    ("dsh", "多播：段外点名不算",           True,  "@claude 你好 @dsh",    True,  "NO_REPLY"),
+    ("workbuddy", "多播：他+我 → 放行",     True,  "@dsh @wb 你好",        False, None),
+    ("workbuddy", "多播：只有他 → 拦",      True,  "@claude @dsh 你好",    True,  "NO_REPLY"),
 
     # ── 命令行传平台名（WorkBuddy 实际用的方式，自包含、不依赖 env）──
     ("arg:workbuddy", "走 --agent 参数",  True,  "@claude 测试",       True,  "NO_REPLY"),
