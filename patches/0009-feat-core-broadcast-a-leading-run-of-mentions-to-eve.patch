@@ -1,0 +1,467 @@
+From 28a9aac9190ede72f98bbdca62ae1cc745467da0 Mon Sep 17 00:00:00 2001
+From: wjxn13 <236573882+wjxn13@users.noreply.github.com>
+Date: Sun, 20 Sep 2026 11:04:20 +0800
+Subject: [PATCH 09/10] feat(core): broadcast a leading run of mentions to
+ every named agent
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+"@wb @dsh 看下这个" used to reach only wb: the gate read the FIRST
+mention and dropped the message for everyone else. Users brief several
+agents at once by writing their names in a row, and every one of them
+should answer.
+
+New two-step rule in mentionGateTargets (engine.go):
+
+1. A contiguous run of @names at the very start of the message (separated
+   only by whitespace, commas, ideographic commas, semicolons, + or &)
+   addresses ALL of them; every hit goes into the owner set, deduped and
+   in written order. scanLeadingMentionRun stops at the first character
+   that is neither a separator nor another alias, so the @dsh inside
+   "@claude 帮我叫 @dsh 干活" stays out of the run; a bare @ ends it.
+2. Otherwise the previous positional rule applies unchanged.
+
+MentionSticky grows from one name into a set: Mark takes variadic
+projects (dedup, REPLACE not merge — a later single @ narrows the set),
+Lookup returns a copy of the slice. The photo after "@wb @dsh 看下这张图"
+belongs to both of them.
+
+mentionGateDrop becomes a thin wrapper joining the owners with "," so
+existing tests and the drop-log format stay stable; mentionsSelf now
+DELEGATES to mentionGateTargets so the stickiness marker and the gate
+can never diverge; rememberAddressee becomes rememberAddressees and
+mediaRouteOwner resolves a whole owner set.
+---
+ core/engine.go         | 231 ++++++++++++++++++++++++++++++-----------
+ core/mention_sticky.go |  58 ++++++++---
+ 2 files changed, 214 insertions(+), 75 deletions(-)
+
+diff --git a/core/engine.go b/core/engine.go
+index dd57e76..8112a3e 100644
+--- a/core/engine.go
++++ b/core/engine.go
+@@ -307,8 +307,8 @@ type Engine struct {
+ 	filterExternalSessions bool
+ 
+ 	// Shell configuration for /shell, cron exec, hooks, webhook exec
+-	shell       string // shell binary path (e.g. "sh", "/bin/zsh")
+-	shellFlag   string // shell flag (e.g. "-c", "-Command", "/C")
++	shell        string // shell binary path (e.g. "sh", "/bin/zsh")
++	shellFlag    string // shell flag (e.g. "-c", "-Command", "/C")
+ 	shellProfile string // prepended to every command (e.g. "source ~/.zshrc;")
+ 
+ 	// Multi-workspace mode
+@@ -2465,16 +2465,31 @@ func (e *Engine) MentionGateEnabled() bool {
+ 	return len(e.mentionAliases) > 0
+ }
+ 
+-// mentionGateDrop decides whether the message should be dropped because it
+-// addresses another agent. It returns the addressed project name and the
+-// matched token; an empty project name means "do not drop".
++// mentionGateTargets resolves every project this message addresses.
+ //
+-// The rule is positional, not set-based: the FIRST alias that appears in the
+-// message wins. A set-based rule ("drop whenever a peer alias appears
+-// anywhere") breaks on messages that address several agents, e.g.
+-// "@claude ask @dsh to run it" — it would silence BOTH agents and the user
+-// would see no reply at all, which is the worst possible failure mode.
+-func (e *Engine) mentionGateDrop(content string) (string, string) {
++// It returns the addressed project names (deduplicated, in the order they were
++// written), the tokens that produced them, and whether THIS engine is among the
++// addressed. Callers drop the message only when `mine` is false and at least one
++// owner was found.
++//
++// Two rules, in this order:
++//
++//  1. A LEADING RUN of aliases wins when present. People write "@wb，@dsh 看下这个"
++//     to brief two agents at once, and every name in that run is genuinely being
++//     addressed — so all of them are returned and all of them answer. The run may
++//     be separated by whitespace or by the punctuation people actually type
++//     between names. It ends at the first character that is neither a separator
++//     nor the start of another alias, which is what keeps the @dsh in
++//     "@claude 帮我叫 @dsh 干活" out of it.
++//
++//  2. Otherwise the original POSITIONAL rule applies: the first alias anywhere in
++//     the message decides. It is deliberately not set-based — a rule like "drop
++//     whenever a peer alias appears anywhere" would silence every agent on
++//     "@claude ask @dsh to run it" and the user would get no reply at all, which
++//     is the worst possible failure mode. Outside a leading run a name is far
++//     more likely to be mentioned ABOUT someone than addressed TO them, so there
++//     the first match keeps deciding.
++func (e *Engine) mentionGateTargets(content string) (owners []string, tokens []string, mine bool) {
+ 	e.mentionMu.RLock()
+ 	self := e.mentionAliases
+ 	peerAliases := e.mentionPeerAlias
+@@ -2483,30 +2498,128 @@ func (e *Engine) mentionGateDrop(content string) (string, string) {
+ 	e.mentionMu.RUnlock()
+ 
+ 	if len(self) == 0 {
+-		return "", "" // gate disabled for this engine
++		return nil, nil, false // gate disabled for this engine
+ 	}
+ 
+-	for _, token := range scanMentionTokens(content) {
++	resolve := func(token string) (owner string, isSelf bool, hit bool) {
+ 		selfAlias, selfHit := longestAliasPrefix(token, self)
+ 		peerAlias, peerHit := longestAliasPrefix(token, peerAliases)
+-
+ 		if selfHit && (!peerHit || len(selfAlias) >= len(peerAlias)) {
+-			return "", "" // addressed to us — let it through
++			return e.name, true, true
+ 		}
+ 		if peerHit {
+-			owner := peerOwner[peerAlias]
++			owner = peerOwner[peerAlias]
+ 			if owner == "" {
+ 				owner = peerAlias
+ 			}
+-			return owner, token
++			return owner, false, true
++		}
++		return "", false, false
++	}
++
++	if run := scanLeadingMentionRun(content); len(run) > 0 {
++		seen := make(map[string]bool, len(run))
++		for _, token := range run {
++			owner, isSelf, hit := resolve(token)
++			if !hit {
++				continue // an alias we do not know is simply not ours to route
++			}
++			if isSelf {
++				mine = true
++			}
++			if !seen[owner] {
++				seen[owner] = true
++				owners = append(owners, owner)
++				tokens = append(tokens, token)
++			}
++		}
++		return owners, tokens, mine
++	}
++
++	for _, token := range scanMentionTokens(content) {
++		owner, isSelf, hit := resolve(token)
++		if !hit {
++			continue
++		}
++		if isSelf {
++			return []string{e.name}, []string{token}, true
+ 		}
++		return []string{owner}, []string{token}, false
+ 	}
+ 
+ 	// The message mentions nobody we know.
+ 	if fallback == "silent" {
+-		return mentionUnaddressed, ""
++		return []string{mentionUnaddressed}, nil, false
++	}
++	return nil, nil, false
++}
++
++// mentionGateDrop reports which project(s) the message should be handed to
++// instead of this engine. An empty project name means "do not drop".
++//
++// Thin wrapper over mentionGateTargets, kept because the single-owner shape reads
++// better at the call sites and in the tests.
++func (e *Engine) mentionGateDrop(content string) (string, string) {
++	owners, tokens, mine := e.mentionGateTargets(content)
++	if mine || len(owners) == 0 {
++		return "", ""
++	}
++	return strings.Join(owners, ","), strings.Join(tokens, ",")
++}
++
++// scanLeadingMentionRun returns the aliases written in the contiguous run of
++// "@name" tokens at the very start of the message, or nil when the message does
++// not open with an alias.
++//
++// Leading whitespace and separators are skipped, so "  @wb，@dsh 你好" opens a run
++// of two. Anything that is neither a separator nor another alias terminates it.
++func scanLeadingMentionRun(content string) []string {
++	runes := []rune(content)
++	i := 0
++	for i < len(runes) && isMentionSeparator(runes[i]) {
++		i++
++	}
++	if i >= len(runes) || runes[i] != '@' {
++		return nil
++	}
++
++	var out []string
++	for i < len(runes) && runes[i] == '@' {
++		j := i + 1
++		for j < len(runes) && isMentionNameRune(runes[j]) {
++			j++
++		}
++		if j == i+1 {
++			break // a bare "@" is not an alias, and it ends the run
++		}
++		out = append(out, strings.ToLower(string(runes[i:j])))
++		i = j
++		for i < len(runes) && isMentionSeparator(runes[i]) {
++			i++
++		}
++	}
++	return out
++}
++
++// isMentionSeparator reports whether r may sit between two aliases inside the
++// leading run: whitespace (ASCII and ideographic) plus the punctuation people
++// type between names.
++func isMentionSeparator(r rune) bool {
++	switch r {
++	case ' ', '\t', '\n', '\r', '\v', '\f':
++		return true
++	case 0x00a0, 0x3000: // non-breaking space, ideographic space
++		return true
++	case ',', 0xff0c: // halfwidth, fullwidth comma
++		return true
++	case 0x3001: // ideographic comma
++		return true
++	case ';', 0xff1b: // halfwidth, fullwidth semicolon
++		return true
++	case '+', '&':
++		return true
+ 	}
+-	return "", ""
++	return false
+ }
+ 
+ // mentionGateBlocked reports whether a message addresses a DIFFERENT agent and,
+@@ -2534,64 +2647,53 @@ func (e *Engine) mentionGateBlocked(origin, content, sessionKey, user string) bo
+ 	if strings.HasPrefix(strings.TrimSpace(content), "/") {
+ 		return false
+ 	}
+-	peer, token := e.mentionGateDrop(content)
+-	if peer == "" {
+-		// The message stays with us. When it named us explicitly, remember that
+-		// for a short while so a follow-up message that names nobody — a bare
++	owners, tokens, mine := e.mentionGateTargets(content)
++	if mine || len(owners) == 0 {
++		// The message stays with us. When it named us explicitly, remember WHO it
++		// named for a short while so a follow-up message that names nobody — a bare
+ 		// Weixin photo above all — still arrives here. Messages that merely fall
+ 		// through on default="answer" deliberately do NOT create stickiness: an
+ 		// unaddressed aside in a multi-project chat would otherwise silently
+ 		// steal the next photo from the project the user actually addressed.
+-		if e.mentionsSelf(content) {
+-			e.rememberAddressee(sessionKey)
++		if mine {
++			e.rememberAddressees(sessionKey, owners)
+ 		}
+ 		return false
+ 	}
+ 	slog.Info("mention gate: message dropped",
+ 		"project", e.name,
+ 		"origin", origin,
+-		"addressed", peer,
+-		"token", token,
++		"addressed", strings.Join(owners, ","),
++		"token", strings.Join(tokens, ","),
+ 		"session", sessionKey,
+ 		"user", user,
+ 	)
+ 	return true
+ }
+ 
+-// rememberAddressee records this project as the session's most recent target.
+-func (e *Engine) rememberAddressee(sessionKey string) {
++// rememberAddressees records which projects the session most recently addressed.
++//
++// It stores the WHOLE set: when a leading run briefs several agents at once, the
++// photo that follows belongs to all of them, not just the first.
++func (e *Engine) rememberAddressees(sessionKey string, owners []string) {
++	if len(owners) == 0 {
++		return
++	}
+ 	e.mentionMu.RLock()
+ 	sticky := e.mentionSticky
+ 	e.mentionMu.RUnlock()
+-	sticky.Mark(sessionKey, e.name)
++	sticky.Mark(sessionKey, owners...)
+ }
+ 
+-// mentionsSelf reports whether content explicitly names this agent, applying the
+-// same positional rule as the gate itself: the FIRST known alias in the message
+-// decides, and only then does it matter whether that alias is ours.
++// mentionsSelf reports whether content explicitly names this agent.
+ //
+-// This mirrors mentionGateDrop on purpose. If the two diverged, a message could
+-// be simultaneously "kept by the gate" and "not recognised as addressed to us",
+-// and the stickiness it created would then be one the gate never honours.
++// It delegates to the gate rather than re-deriving the rule, so the stickiness
++// marker and the gate can never disagree: if they diverged, a message could be
++// simultaneously "kept by the gate" and "not recognised as addressed to us", and
++// the stickiness it created would be one the gate never honours.
+ func (e *Engine) mentionsSelf(content string) bool {
+-	e.mentionMu.RLock()
+-	self := e.mentionAliases
+-	peerAliases := e.mentionPeerAlias
+-	e.mentionMu.RUnlock()
+-	if len(self) == 0 {
+-		return false
+-	}
+-	for _, token := range scanMentionTokens(content) {
+-		selfAlias, selfHit := longestAliasPrefix(token, self)
+-		peerAlias, peerHit := longestAliasPrefix(token, peerAliases)
+-		if selfHit && (!peerHit || len(selfAlias) >= len(peerAlias)) {
+-			return true
+-		}
+-		if peerHit {
+-			return false
+-		}
+-	}
+-	return false
++	_, _, mine := e.mentionGateTargets(content)
++	return mine
+ }
+ 
+ // bareMediaMessage reports whether a message carries attachments but no text.
+@@ -2609,9 +2711,13 @@ func bareMediaMessage(msg *Message) bool {
+ // mediaRouteOwner resolves who should receive a text-less media message.
+ //
+ // claimed=false means "nobody claims it, use the plain default". When claimed is
+-// true, `mine` tells this engine whether it is the owner — the two are separate
+-// so that a peer being the owner results in a DROP rather than a fall-through to
+-// default="answer".
++// true, `mine` tells this engine whether it is one of the owners — the two are
++// separate so that a peer being the owner results in a DROP rather than a
++// fall-through to default="answer".
++//
++// The owner is a SET: a leading run may have briefed several agents at once
++// ("@wb，@dsh 看下这张图"), and the photo that follows belongs to every one of them.
++// `owner` is the comma-joined list purely so the drop log can name them all.
+ func (e *Engine) mediaRouteOwner(sessionKey string) (claimed bool, mine bool, owner string) {
+ 	e.mentionMu.RLock()
+ 	sticky := e.mentionSticky
+@@ -2619,8 +2725,14 @@ func (e *Engine) mediaRouteOwner(sessionKey string) (claimed bool, mine bool, ow
+ 	self := e.name
+ 	e.mentionMu.RUnlock()
+ 
+-	if owner := sticky.Lookup(sessionKey); owner != "" {
+-		return true, owner == self, owner
++	if owners := sticky.Lookup(sessionKey); len(owners) > 0 {
++		joined := strings.Join(owners, ",")
++		for _, o := range owners {
++			if o == self {
++				return true, true, joined
++			}
++		}
++		return true, false, joined
+ 	}
+ 	if target != "" {
+ 		return true, target == self, target
+@@ -2759,7 +2871,6 @@ func isMentionNameRune(r rune) bool {
+ 	return false
+ }
+ 
+-
+ func (e *Engine) handleMessageRecall(p Platform, msg *Message) {
+ 	messageID := strings.TrimSpace(msg.MessageID)
+ 	if messageID == "" {
+diff --git a/core/mention_sticky.go b/core/mention_sticky.go
+index 0f8df15..319e49e 100644
+--- a/core/mention_sticky.go
++++ b/core/mention_sticky.go
+@@ -29,13 +29,19 @@ import (
+ // silently route a much later photo to a project they forgot they addressed.
+ const DefaultMentionStickyTTL = 3 * time.Minute
+ 
+-// MentionSticky remembers, per chat session, the project most recently addressed
+-// by alias.
++// MentionSticky remembers, per chat session, the project (or projects) most
++// recently addressed by alias.
+ //
+ // ONE instance is shared by every engine in the process. The routing question
+ // ("is this bare photo mine?") can only be answered by comparing what this engine
+ // is called against what the session last addressed — knowledge no single engine
+ // holds on its own, since each engine only ever sees its own aliases.
++//
++// It holds a SET, not a single name, because a leading run may address several
++// projects at once ("@wb，@dsh 看下这张图"). When that happens every named project
++// is a legitimate owner of the photo that follows, so all of them must be
++// remembered. Collapsing to one name would silently drop the photo for the
++// others — the same bug this registry was created to fix, just narrower.
+ type MentionSticky struct {
+ 	ttl time.Duration
+ 
+@@ -44,8 +50,8 @@ type MentionSticky struct {
+ }
+ 
+ type mentionStickyMark struct {
+-	project string
+-	at      time.Time
++	projects []string
++	at       time.Time
+ }
+ 
+ // NewMentionSticky builds a registry. A ttl <= 0 falls back to
+@@ -58,33 +64,55 @@ func NewMentionSticky(ttl time.Duration) *MentionSticky {
+ 	return &MentionSticky{ttl: ttl, marks: make(map[string]mentionStickyMark)}
+ }
+ 
+-// Mark records that the user just addressed `project` on this session.
+-func (s *MentionSticky) Mark(sessionKey, project string) {
+-	if s == nil || sessionKey == "" || project == "" {
++// Mark records that the user just addressed `projects` on this session.
++//
++// It REPLACES any previous mark rather than merging: the question is "who did the
++// user address most recently", and a later "@dsh" must not keep an earlier
++// "@wb" alive, or a photo typed minutes afterwards would fan out to a project the
++// user had already moved on from.
++func (s *MentionSticky) Mark(sessionKey string, projects ...string) {
++	if s == nil || sessionKey == "" || len(projects) == 0 {
++		return
++	}
++	clean := make([]string, 0, len(projects))
++	seen := make(map[string]bool, len(projects))
++	for _, p := range projects {
++		if p == "" || seen[p] {
++			continue
++		}
++		seen[p] = true
++		clean = append(clean, p)
++	}
++	if len(clean) == 0 {
+ 		return
+ 	}
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()
+-	s.marks[sessionKey] = mentionStickyMark{project: project, at: time.Now()}
++	s.marks[sessionKey] = mentionStickyMark{projects: clean, at: time.Now()}
+ }
+ 
+-// Lookup returns the project most recently addressed on this session, or "" when
+-// there is none or the mark has expired.
+-func (s *MentionSticky) Lookup(sessionKey string) string {
++// Lookup returns the projects most recently addressed on this session, or nil
++// when there are none or the mark has expired.
++func (s *MentionSticky) Lookup(sessionKey string) []string {
+ 	if s == nil || sessionKey == "" {
+-		return ""
++		return nil
+ 	}
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()
+ 	mark, ok := s.marks[sessionKey]
+ 	if !ok {
+-		return ""
++		return nil
+ 	}
+ 	if time.Since(mark.at) > s.ttl {
+ 		delete(s.marks, sessionKey)
+-		return ""
++		return nil
++	}
++	if len(mark.projects) == 0 {
++		return nil
+ 	}
+-	return mark.project
++	out := make([]string, len(mark.projects))
++	copy(out, mark.projects)
++	return out
+ }
+ 
+ // Forget drops the mark for one session. Used when a session is reset so a

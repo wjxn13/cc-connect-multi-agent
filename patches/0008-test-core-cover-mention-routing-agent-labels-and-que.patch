@@ -1,7 +1,7 @@
 From ca504108720e7a91af6df60f17a9e21879fe71be Mon Sep 17 00:00:00 2001
 From: wjxn13 <236573882+wjxn13@users.noreply.github.com>
 Date: Sat, 19 Sep 2026 23:01:12 +0800
-Subject: [PATCH 8/8] test(core): cover mention routing, agent labels and
+Subject: [PATCH 08/10] test(core): cover mention routing, agent labels and
  queued messages
 
 Adds offline coverage for the addressing layer introduced in the previous
@@ -1251,6 +1251,3 @@ index 0000000..5e25038
 +		}
 +	}
 +}
--- 
-2.55.0.windows.3
-

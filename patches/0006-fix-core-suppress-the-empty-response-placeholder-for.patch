@@ -1,7 +1,7 @@
 From d4e633fed88d58a74f7d150a21f2753ac6e2496f Mon Sep 17 00:00:00 2001
-From: wjxn13 <236573882+wjxn13@users.noreply.github.com>
+From: wjxn13 <yqyj33@qq.com>
 Date: Wed, 16 Sep 2026 23:06:12 +0800
-Subject: [PATCH 6/6] fix(core): suppress the empty-response placeholder for
+Subject: [PATCH 06/10] fix(core): suppress the empty-response placeholder for
  hook-blocked turns
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

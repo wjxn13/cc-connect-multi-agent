@@ -1,0 +1,463 @@
+From c07753a9ff45c550bbc083d121e5995b522428f5 Mon Sep 17 00:00:00 2001
+From: wjxn13 <236573882+wjxn13@users.noreply.github.com>
+Date: Sun, 20 Sep 2026 11:04:39 +0800
+Subject: [PATCH 10/10] test(core): cover multi-mention broadcast and set-based
+ sticky routing
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+gatedEngine now names its engine ("my-self"): a leading run that names
+us puts that name into the addressed set, and an unnamed engine would
+silently skip the real path.
+
+New in mention_route_test.go:
+
+- LeadingRunWins: the run is read to its end (self closing "@dsh @claude
+  是谁" still answers), a body mention does not join it, and both peers
+  inside the run are reported as "my-dsh,my-workbuddy".
+- LeadingRunSeparators: halfwidth/fullwidth commas, ideographic comma,
+  plus sign, ideographic space and a leading indent all split nothing;
+  a plain word and a bare @ both terminate the run.
+- LeadingRunBroadcasts (cluster level): "@wb @dsh", "@wb，@dsh" and the
+  three-name run all deliver to every named project, while "@dsh 先看，
+  @claude 再说" stays first-mention-wins.
+
+New in mention_sticky_test.go:
+
+- MarkHoldsASet: dedup, REPLACE-not-merge narrowing, all-blank Mark
+  keeps the previous set, and Lookup hands out a copy.
+- MultipleAddresseesAllReceiveIt: the caption-less photo after a
+  two-name broadcast reaches both owners, and a later single @ narrows
+  it back down.
+- fallbackTable is synced to the live config.toml (default answerer
+  moved from the Claude project to WorkBuddy on 2026-09-20); the three
+  assertions that pinned the old defaults follow.
+- TestMentionsSelf_MatchesGateRule renames the positional version:
+  "@dsh @claude 是谁" is now true — a leading run that contains us
+  addresses us even when a peer opens it.
+---
+ core/mention_route_test.go  | 123 ++++++++++++++++++++++++++--
+ core/mention_sticky_test.go | 156 ++++++++++++++++++++++++++++--------
+ 2 files changed, 237 insertions(+), 42 deletions(-)
+
+diff --git a/core/mention_route_test.go b/core/mention_route_test.go
+index 1587471..e5aa70d 100644
+--- a/core/mention_route_test.go
++++ b/core/mention_route_test.go
+@@ -7,12 +7,19 @@ import (
+ 	"reflect"
+ 	"strings"
+ 	"testing"
++	"time"
+ )
+ 
+ // gatedEngine builds an engine with the mention gate installed the same way
+ // main.go does it for one project.
++//
++// The engine carries a name because a leading run that names us puts this name
++// into the addressed set (the set feeds the photo-stickiness registry, and we
++// are as much an owner of the following photo as any peer). An unnamed engine
++// would silently take a different path, and a test that never exercises the real
++// one is not worth much.
+ func gatedEngine(self []string, peers map[string][]string, fallback string) *Engine {
+-	e := &Engine{}
++	e := &Engine{name: "my-self"}
+ 	e.SetMentionRouting(self, peers, fallback)
+ 	return e
+ }
+@@ -56,23 +63,125 @@ func TestMentionGate_SingleMention(t *testing.T) {
+ 	}
+ }
+ 
+-// TestMentionGate_FirstMentionWins pins the positional rule. A set-based rule
+-// ("drop whenever any peer alias appears") would silence both agents on a
+-// message that names two of them, leaving the user with no reply at all.
+-func TestMentionGate_FirstMentionWins(t *testing.T) {
++// TestMentionGate_LeadingRunWins pins the first of the two rules: a contiguous
++// run of aliases at the very start of the message addresses ALL of them, and the
++// message is then read no further.
++//
++// The run must not be confused with a set-based rule ("answer whenever our alias
++// appears anywhere"). That rule would make "@claude ask @dsh to run it" address
++// both agents, and the user asking Claude to brief DSH would get two replies
++// (or, worse, two agents racing on the same task). A name outside the leading run
++// is far more often mentioned ABOUT someone than addressed TO them, so it does
++// not route anything.
++func TestMentionGate_LeadingRunWins(t *testing.T) {
+ 	e := standardClaudeEngine()
+ 
++	// Self opens the run: we answer, and the peer named after it is not an owner
++	// of this message as far as we are concerned.
+ 	if got, tok := e.mentionGateDrop("@claude 帮我叫 @dsh 干活"); got != "" {
+ 		t.Errorf("self first must answer, got dropped by %q (token %q)", got, tok)
+ 	}
++
++	// A single leading name followed by a mention in the body: only the leading
++	// run counts, so the body mention routes nowhere.
+ 	if got, _ := e.mentionGateDrop("@dsh 先看，@claude 再说"); got != "my-dsh" {
+-		t.Errorf("peer first must drop, got %q", got)
++		t.Errorf("leading run must decide, got %q", got)
+ 	}
+ 	if got, _ := e.mentionGateDrop("@workbuddy 别插话，然后 @dsh 上"); got != "my-workbuddy" {
+-		t.Errorf("first of two peers must win, got %q", got)
++		t.Errorf("leading run of one must decide, got %q", got)
++	}
++
++	// A peer opening the run while we are named later inside the same run: the
++	// run is read to its end, so we are addressed too and must answer.
++	if got, _ := e.mentionGateDrop("@dsh @claude 是谁"); got != "" {
++		t.Errorf("self inside the leading run must answer, got dropped by %q", got)
++	}
++
++	// Same shape, but we are not in the run at all: we stay out of it.
++	if got, _ := e.mentionGateDrop("@dsh @workbuddy 开会"); got != "my-dsh,my-workbuddy" {
++		t.Errorf("both peers in the leading run must be reported, got %q", got)
++	}
++}
++
++// TestMentionGate_LeadingRunSeparators pins which characters may sit between two
++// names inside the run. Chinese input arrives with fullwidth punctuation, and
++// "@wb，@dsh" typed on a real IME is the shape this feature was asked for — a rule
++// that only accepted a bare space would broadcast on the test rig and on nothing
++// else.
++func TestMentionGate_LeadingRunSeparators(t *testing.T) {
++	e := standardClaudeEngine()
++
++	// Same decision as seen BY the peer: both peers own the message.
++	peerView := gatedEngine(
++		[]string{"@claude"},
++		map[string][]string{
++			"my-dsh":       {"@dsh"},
++			"my-workbuddy": {"@workbuddy"},
++		},
++		"answer",
++	)
++
++	for _, content := range []string{
++		"@dsh @workbuddy 开会",
++		"@dsh, @workbuddy 开会",
++		"@dsh，@workbuddy 开会",    // fullwidth comma
++		"@dsh、@workbuddy 开会",    // ideographic comma
++		"@dsh + @workbuddy 开会",  // the way a slash-command habit types it
++		"@dsh　@workbuddy 开会",    // ideographic space
++		"   @dsh @workbuddy 开会", // leading indent, e.g. a TOML multi-line prompt
++	} {
++		if got, _ := peerView.mentionGateDrop(content); got != "my-dsh,my-workbuddy" {
++			t.Errorf("mentionGateDrop(%q) = %q, want both peers", content, got)
++		}
++	}
++
++	// The run stops at the first thing that is neither separator nor alias, so a
++	// word between two names splits it.
++	if got, _ := e.mentionGateDrop("@dsh 先看 @workbuddy 再说"); got != "my-dsh" {
++		t.Errorf("a word must terminate the run, got %q", got)
++	}
++
++	// A bare "@" is not an alias; it ends the run rather than being skipped over,
++	// otherwise "@ @dsh" would quietly address dsh.
++	if got, _ := e.mentionGateDrop("@ @dsh 看下"); got != "my-dsh" {
++		t.Errorf("bare @ must not join the run, got %q", got)
+ 	}
+ }
+ 
++// TestMentionGate_LeadingRunBroadcasts checks the feature at cluster level, which
++// is the only level where "everybody answered" is observable: each engine reads
++// the message with its own alias table, so a per-engine assertion can only say
++// what ONE of them decided.
++func TestMentionGate_LeadingRunBroadcasts(t *testing.T) {
++	c := newMentionCluster(time.Minute, "")
++
++	// Two names, one space apart: both answer.
++	assertDelivered(t, c.deliver("@wb @dsh 看下这个", 0), "my-dsh", "my-workbuddy")
++
++	// The fullwidth comma is how this actually gets typed on a Chinese IME.
++	assertDelivered(t, c.deliver("@wb，@dsh 看下这个", 0), "my-dsh", "my-workbuddy")
++
++	// Three names: all three answer.
++	assertDelivered(t, c.deliver("@claude @dsh @wb 开个会", 0),
++		"my-project", "my-dsh", "my-workbuddy")
++
++	// The leading run is read to its end even when the words after it read like a
++	// question about the agents rather than a task for them. This is the accepted
++	// cost of the rule the user chose (only a LEADING run broadcasts); the next
++	// case is the guard that keeps the cost from spreading to body mentions.
++	assertDelivered(t, c.deliver("@dsh @claude 是谁", 0), "my-project", "my-dsh")
++
++	// A name in the BODY is not a broadcast. Only the first name decides, exactly
++	// as before this feature.
++	assertDelivered(t, c.deliver("@dsh 先看，@claude 再说", 0), "my-dsh")
++
++	// A word between two names splits the run, leaving only the first addressed.
++	assertDelivered(t, c.deliver("@wb 先写，@dsh 再看", 0), "my-workbuddy")
++
++	// Peers only: the project left out of the run stays out.
++	assertDelivered(t, c.deliver("@dsh @wb 一起看", 0), "my-dsh", "my-workbuddy")
++}
++
+ func TestMentionGate_CaseInsensitive(t *testing.T) {
+ 	e := standardClaudeEngine()
+ 
+diff --git a/core/mention_sticky_test.go b/core/mention_sticky_test.go
+index adb5e99..1a00e44 100644
+--- a/core/mention_sticky_test.go
++++ b/core/mention_sticky_test.go
+@@ -18,7 +18,13 @@ type mentionCluster struct {
+ 	engines map[string]*Engine
+ }
+ 
+-// aliasTable / fallbackTable reproduce this machine's live config.toml.
++// aliasTable / fallbackTable reproduce this machine's live config.toml as of
++// 2026-09-19, when the default answerer for unaddressed text moved from the
++// Claude project to WorkBuddy (the user asked for plain text without an @ to
++// reach WB). Keeping the table honest matters: these tests are the only place
++// that pins what an unaddressed message and an unclaimed photo actually do, and
++// a fixture stuck on the previous defaults would be pinning a deployment that no
++// longer exists.
+ var (
+ 	aliasTable = map[string][]string{
+ 		"my-project":   {"@claude"},
+@@ -26,9 +32,9 @@ var (
+ 		"my-workbuddy": {"@wb"},
+ 	}
+ 	fallbackTable = map[string]string{
+-		"my-project":   "answer",
++		"my-project":   "silent",
+ 		"my-dsh":       "silent",
+-		"my-workbuddy": "silent",
++		"my-workbuddy": "answer",
+ 	}
+ )
+ 
+@@ -117,9 +123,9 @@ func TestBarePhoto_ExpiresWithTTL(t *testing.T) {
+ 	assertDelivered(t, c.deliver("@dsh 看图", 0), "my-dsh")
+ 	time.Sleep(60 * time.Millisecond)
+ 
+-	// Sticky mark is gone; my-project is the only project whose default lets an
++	// Sticky mark is gone; my-workbuddy is the only project whose default lets an
+ 	// unaddressed message through.
+-	assertDelivered(t, c.deliver("", 1), "my-project")
++	assertDelivered(t, c.deliver("", 1), "my-workbuddy")
+ }
+ 
+ // ── media_default fallback ──────────────────────────────────
+@@ -141,12 +147,13 @@ func TestBarePhoto_StickyBeatsMediaOwner(t *testing.T) {
+ 	assertDelivered(t, c.deliver("", 1), "my-dsh")
+ }
+ 
+-// TestBarePhoto_NoStickyNoOwnerKeepsOldBehaviour is the regression guard for
+-// deployments that configure neither feature: a photo must behave exactly as it
+-// did before, i.e. only default="answer" projects take it.
+-func TestBarePhoto_NoStickyNoOwnerKeepsOldBehaviour(t *testing.T) {
++// TestBarePhoto_NoStickyNoOwnerFallsBackToDefault is the regression guard for
++// deployments that configure neither stickiness nor a media owner: a photo with
++// nothing to route it must behave exactly as it did before either feature
++// existed, i.e. only the default="answer" project takes it.
++func TestBarePhoto_NoStickyNoOwnerFallsBackToDefault(t *testing.T) {
+ 	c := newMentionCluster(time.Minute, "")
+-	assertDelivered(t, c.deliver("", 1), "my-project")
++	assertDelivered(t, c.deliver("", 1), "my-workbuddy")
+ }
+ 
+ // TestBareFileAndVoiceFollowThePhotoRules keeps the fix from being photo-only:
+@@ -189,7 +196,7 @@ func TestTextMessages_AreUnaffectedByStickiness(t *testing.T) {
+ 	assertDelivered(t, c.deliver("@claude 你好", 0), "my-project")
+ }
+ 
+-// TestUnaddressedText_DoesNotStealStickiness closes a subtle hole: my-project
++// TestUnaddressedText_DoesNotStealStickiness closes a subtle hole: my-workbuddy
+ // runs with default="answer", so it accepts any unaddressed message. If that
+ // acceptance registered stickiness, an offhand remark between "@dsh" and the
+ // photo would hijack the photo.
+@@ -198,9 +205,9 @@ func TestUnaddressedText_DoesNotStealStickiness(t *testing.T) {
+ 
+ 	assertDelivered(t, c.deliver("@dsh 帮我看图", 0), "my-dsh")
+ 
+-	// An unaddressed aside — answered by my-project because its default is
++	// An unaddressed aside — answered by my-workbuddy because its default is
+ 	// "answer" — must not become the session's addressee.
+-	assertDelivered(t, c.deliver("今天天气不错", 0), "my-project")
++	assertDelivered(t, c.deliver("今天天气不错", 0), "my-workbuddy")
+ 
+ 	// The photo must still go to DSH.
+ 	assertDelivered(t, c.deliver("", 1), "my-dsh")
+@@ -234,10 +241,18 @@ func TestTextWithAttachment_IsNotBareMedia(t *testing.T) {
+ 	}
+ }
+ 
+-// TestMentionsSelf_MatchesGatePositionalRule pins that the stickiness marker and
+-// the gate agree on who was addressed. They use the same first-known-alias rule;
+-// if they diverge, a message could be kept by the gate yet create no stickiness.
+-func TestMentionsSelf_MatchesGatePositionalRule(t *testing.T) {
++// TestMentionsSelf_MatchesGateRule pins that the stickiness marker and the gate
++// agree on who was addressed. mentionsSelf delegates to the gate rather than
++// re-deriving the rule; if they diverged, a message could be kept by the gate yet
++// create no stickiness, and the photo that followed would go nowhere.
++//
++// The interesting case is the third one. Under the old first-mention-wins rule a
++// peer opening the message hid the self-mention behind it; now that a leading run
++// addresses everybody in it, we are addressed too and must answer. Both projects
++// answer, which is exactly what "@dsh @claude 是谁" asks for — as a question it is
++// answered by two agents instead of one, and that is the accepted cost of the
++// rule the user chose.
++func TestMentionsSelf_MatchesGateRule(t *testing.T) {
+ 	e := standardClaudeEngine()
+ 
+ 	cases := []struct {
+@@ -245,8 +260,10 @@ func TestMentionsSelf_MatchesGatePositionalRule(t *testing.T) {
+ 		want    bool
+ 	}{
+ 		{"@claude 帮我写个函数", true},
+-		{"@claude @dsh 是谁", true},   // self is first
+-		{"@dsh @claude 是谁", false},  // peer is first, so the gate routes it away
++		{"@claude @dsh 是谁", true},     // self opens the leading run
++		{"@dsh @claude 是谁", true},     // self closes the leading run — still addressed
++		{"@dsh @workbuddy 开会", false}, // peers only; we are not in the run
++		{"@dsh 先看，@claude 再说", false}, // body mention, not part of the run
+ 		{"麻烦 @claude 看一下", true},
+ 		{"普通消息，没有任何点名", false},
+ 		{"", false},
+@@ -270,23 +287,65 @@ func TestMentionsSelf_MatchesGatePositionalRule(t *testing.T) {
+ func TestMentionSticky_MarkLookupForget(t *testing.T) {
+ 	s := NewMentionSticky(time.Minute)
+ 
+-	if got := s.Lookup("sess"); got != "" {
+-		t.Errorf("empty registry Lookup = %q, want empty", got)
++	if got := s.Lookup("sess"); len(got) != 0 {
++		t.Errorf("empty registry Lookup = %v, want empty", got)
+ 	}
+ 
+ 	s.Mark("sess", "my-dsh")
+-	if got := s.Lookup("sess"); got != "my-dsh" {
+-		t.Errorf("Lookup = %q, want my-dsh", got)
++	if got := s.Lookup("sess"); !reflect.DeepEqual(got, []string{"my-dsh"}) {
++		t.Errorf("Lookup = %v, want [my-dsh]", got)
+ 	}
+ 
+ 	// Sessions are independent.
+-	if got := s.Lookup("other"); got != "" {
+-		t.Errorf("unrelated session Lookup = %q, want empty", got)
++	if got := s.Lookup("other"); len(got) != 0 {
++		t.Errorf("unrelated session Lookup = %v, want empty", got)
+ 	}
+ 
+ 	s.Forget("sess")
+-	if got := s.Lookup("sess"); got != "" {
+-		t.Errorf("after Forget Lookup = %q, want empty", got)
++	if got := s.Lookup("sess"); len(got) != 0 {
++		t.Errorf("after Forget Lookup = %v, want empty", got)
++	}
++}
++
++// TestMentionSticky_MarkHoldsASet pins the multi-@ half of the registry: one
++// leading run may brief several projects, and every one of them owns the media
++// that follows.
++func TestMentionSticky_MarkHoldsASet(t *testing.T) {
++	s := NewMentionSticky(time.Minute)
++
++	s.Mark("sess", "my-workbuddy", "my-dsh")
++	if got := s.Lookup("sess"); !reflect.DeepEqual(got, []string{"my-workbuddy", "my-dsh"}) {
++		t.Errorf("Lookup = %v, want both projects in the order marked", got)
++	}
++
++	// A repeated name is kept once: the set is what is being routed to, and a
++	// duplicate would only make the drop log harder to read.
++	s.Mark("sess", "my-dsh", "my-dsh", "my-workbuddy")
++	if got := s.Lookup("sess"); !reflect.DeepEqual(got, []string{"my-dsh", "my-workbuddy"}) {
++		t.Errorf("Lookup after dedup = %v, want two distinct projects", got)
++	}
++
++	// Marking must REPLACE, not merge: a later single-@ message narrows the set.
++	// Merging would keep a photo fanning out to a project the user had already
++	// moved on from.
++	s.Mark("sess", "my-dsh")
++	if got := s.Lookup("sess"); !reflect.DeepEqual(got, []string{"my-dsh"}) {
++		t.Errorf("Lookup after narrowing = %v, want [my-dsh] only", got)
++	}
++
++	// A Mark with nothing usable in it must not erase what is already there.
++	s.Mark("sess", "my-dsh", "my-workbuddy")
++	s.Mark("sess", "", "")
++	if got := s.Lookup("sess"); !reflect.DeepEqual(got, []string{"my-dsh", "my-workbuddy"}) {
++		t.Errorf("Lookup after an all-blank Mark = %v, want the previous set intact", got)
++	}
++
++	// What Lookup hands out must be a copy: a caller editing the slice must not
++	// be able to corrupt the registry.
++	got := s.Lookup("sess")
++	got[0] = "mutated"
++	if again := s.Lookup("sess"); again[0] != "my-dsh" {
++		t.Errorf("Lookup returned a shared backing array: %v", again)
+ 	}
+ }
+ 
+@@ -310,8 +369,8 @@ func TestMentionSticky_IgnoresEmptyInputs(t *testing.T) {
+ 	s.Mark("sess", "")
+ 
+ 	for _, key := range []string{"", "sess"} {
+-		if got := s.Lookup(key); got != "" {
+-			t.Errorf("Lookup(%q) = %q, want empty", key, got)
++		if got := s.Lookup(key); len(got) != 0 {
++			t.Errorf("Lookup(%q) = %v, want empty", key, got)
+ 		}
+ 	}
+ }
+@@ -321,8 +380,8 @@ func TestMentionSticky_IgnoresEmptyInputs(t *testing.T) {
+ func TestMentionSticky_NilReceiverIsSafe(t *testing.T) {
+ 	var s *MentionSticky
+ 	s.Mark("sess", "my-dsh")
+-	if got := s.Lookup("sess"); got != "" {
+-		t.Errorf("nil Lookup = %q, want empty", got)
++	if got := s.Lookup("sess"); len(got) != 0 {
++		t.Errorf("nil Lookup = %v, want empty", got)
+ 	}
+ 	s.Forget("sess")
+ 	if got := s.TTL(); got != 0 {
+@@ -343,16 +402,43 @@ func TestMentionSticky_NilReceiverIsSafe(t *testing.T) {
+ func TestMediaRouteOwner_PeerOwnerDropsNotFallsThrough(t *testing.T) {
+ 	c := newMentionCluster(time.Minute, "")
+ 
+-	// my-project has default="answer"; DSH is addressed first.
++	// my-workbuddy has default="answer" (the most permissive project in the
++	// cluster); DSH is addressed first.
+ 	assertDelivered(t, c.deliver("@dsh 看图", 0), "my-dsh")
+ 
+-	// The photo is claimed by my-dsh, so my-project must NOT take it despite its
+-	// permissive default.
++	// The photo is claimed by my-dsh, so my-workbuddy must NOT take it despite its
++	// permissive default — otherwise the user's photo would be answered twice.
+ 	assertDelivered(t, c.deliver("", 1), "my-dsh")
+ 
+ 	// Direct check of the peer-owner branch.
+-	e := c.engines["my-project"]
++	e := c.engines["my-workbuddy"]
+ 	if claimed, mine, owner := e.mediaRouteOwner("weixin:dm:u1"); !claimed || mine || owner != "my-dsh" {
+ 		t.Errorf("mediaRouteOwner = (claimed=%v, mine=%v, owner=%q), want (true, false, my-dsh)", claimed, mine, owner)
+ 	}
+ }
++
++// TestBarePhoto_MultipleAddresseesAllReceiveIt is the second half of the
++// multi-@ contract, and the reason MentionSticky had to grow from a single name
++// into a set.
++//
++// "@wb @dsh 看这张图" is two messages as far as Weixin is concerned: the text, and
++// then the photo on its own. If the registry kept only the first name, the photo
++// would reach WB and silently vanish for DSH — the user would see exactly the bug
++// this registry was built to fix, just with two names instead of one.
++func TestBarePhoto_MultipleAddresseesAllReceiveIt(t *testing.T) {
++	c := newMentionCluster(time.Minute, "")
++
++	assertDelivered(t, c.deliver("@wb @dsh 看这张图", 0), "my-dsh", "my-workbuddy")
++
++	// Nobody is named, so both owners are resolved from the session's mark.
++	assertDelivered(t, c.deliver("", 1), "my-dsh", "my-workbuddy")
++
++	// The third project was never addressed; a permissive default must not make it
++	// grab the photo (my-workbuddy is the one with default="answer" here).
++	assertDelivered(t, c.deliver("", 1), "my-dsh", "my-workbuddy")
++
++	// Naming a single project afterwards narrows the set again rather than
++	// merging with it.
++	assertDelivered(t, c.deliver("@wb 只看我这张", 0), "my-workbuddy")
++	assertDelivered(t, c.deliver("", 1), "my-workbuddy")
++}

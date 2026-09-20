@@ -1,7 +1,7 @@
 From 88b27e248e35c5d34128a55b5427bdb35138015c Mon Sep 17 00:00:00 2001
 From: wjxn13 <236573882+wjxn13@users.noreply.github.com>
 Date: Sat, 19 Sep 2026 23:01:04 +0800
-Subject: [PATCH 7/8] feat(core): add cross-agent mention gate, agent labels
+Subject: [PATCH 07/10] feat(core): add cross-agent mention gate, agent labels
  and sticky media routing
 
 Problem
@@ -1314,6 +1314,3 @@ index 6ee5088..039a574 100644
  	platformName := ""
  	if idx := strings.Index(sessionKey, ":"); idx > 0 {
  		platformName = sessionKey[:idx]
--- 
-2.55.0.windows.3
-

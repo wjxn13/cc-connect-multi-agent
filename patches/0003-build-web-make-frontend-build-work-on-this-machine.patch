@@ -1,7 +1,7 @@
 From b5ce849d3b6498497652e2bced8cc87ef5427f10 Mon Sep 17 00:00:00 2001
-From: wjxn13 <236573882+wjxn13@users.noreply.github.com>
+From: wjxn13 <yqyj33@qq.com>
 Date: Tue, 15 Sep 2026 21:01:46 +0800
-Subject: [PATCH 3/6] build(web): make frontend build work on this machine
+Subject: [PATCH 03/10] build(web): make frontend build work on this machine
 
 pnpm's default symlink linker does not work here: every dependency of
 vite ends up as an empty directory plus a .ignored_* marker, and vite

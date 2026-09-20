@@ -5,7 +5,7 @@
 
 | 组 | 补丁 | 解决什么 | 位置 |
 |---|---|---|---|
-| **A. 点名路由** | `0007` – `0008` | 让「@ 了谁」决定消息进哪个 agent | **L1**，消息进 agent **之前** |
+| **A. 点名路由** | `0007` – `0010` | 让「@ 了谁」决定消息进哪个 agent | **L1**，消息进 agent **之前** |
 | **B. hook-block 静默** | `0001` – `0006` | 让「被前置钩子拦掉」的回合不要漏出空响应/包装文本 | **L2 的配套**，模型调用**之前**拦、拦完**输出**要干净 |
 
 两组**互不依赖，可单独套用**：
@@ -19,7 +19,7 @@
 
 ---
 
-# A 组：点名路由（0007 – 0008）
+# A 组：点名路由（0007 – 0010）
 
 ## 为什么需要
 
@@ -44,6 +44,8 @@
 |---|---|---|
 | `0007` | `feat(core): add cross-agent mention gate, agent labels and sticky media routing` | **主补丁（+984 行）**：引擎层点名关卡、粘性媒体路由、出站身份前缀、以及三处「共用账号时才暴露」的文案修正 |
 | `0008` | `test(core): cover mention routing, agent labels and queued messages` | 离线测试（+1176 行），内容全部是新增的 `_test.go` |
+| `0009` | `feat(core): broadcast a leading run of mentions to every named agent` | **多点名广播（2026-09-20）**：句首连着写多个 `@` 时段内每个被点名的 project 都放行；`MentionSticky` 由「记一个」改「记一组」，后续裸图片归全部被点名者 |
+| `0010` | `test(core): cover multi-mention broadcast and set-based sticky routing` | 多播与多 owner 粘性的测试；并把测试夹具的 `default` 表同步到当天实际配置（默认应答者 claude → wb） |
 
 ### `0007` 具体改了什么
 
@@ -64,6 +66,28 @@
 投递对了，但这个 project 的默认动作是闭嘴，而带图那条消息**没有可被点名的文字**。
 所以 `media_default` 认领媒体、和 `default` 决定是否作答，是**两件独立的事**。
 
+### `0009` 多点名广播：改判定语义时，规则文字必须跟着改
+
+**语义（用户拍板，别自行改）**：
+
+1. **只有句首连着写才多播** —— `@wb @dsh 看下这个` 两家都答；
+   `@claude 帮我叫 @dsh 干活` 里的 `@dsh` 在句首段**之外**，不参与判定。
+   全句集合判定会让「提到别人」的消息两家同时沉默，是最坏的失败模式，明确不采用。
+2. **粘性记全部被点名的** —— `@wb @dsh 看下这张图` 之后单独发的那张图，同时归 wb 和 dsh。
+
+**算法**：`scanLeadingMentionRun` 取句首连续段（分隔符白名单：空白、`,`/`，`、`、`、`;`/`；`、`+`、`&`；
+裸 `@` 终止整段），段内每个命中别名的 token 都进 owner 集合（去重、保序）；
+段为空才退回旧的「第一个命中者赢」。`mentionGateDrop` 降为薄包装（owner 列表 `strings.Join` 成
+`"a,b"`），日志与既有测试的形状不变。
+
+**⭐ 本次实际踩到的坑**：只改 L1 关卡是**不够的**。消息被关卡放行后还要过 **L3 规则文字**，
+当时四处规则都写着「正文点名了别的 agent 就 `NO_REPLY`（句首或句中都一样）」，
+于是 `@claude @dsh 谁写得对` 虽被放行给两家，**两家都会回 `NO_REPLY` → 一起沉默**。
+规则必须与关卡判定对齐，统一改成「**句首点名段**」写法（段里有我 → 答，段里还有别人也要答；
+段里有别人没我 → `NO_REPLY`；**段之外的 `@名字` 不参与判定**）。
+四个文件：`config.toml` 的 `append_system_prompt`、`C:\Users\86180\AGENTS.md`、
+`wb-agent` 的 `AGENTS.md` 与 `CLAUDE.md`。细节见 `docs/07` §2.5。
+
 ## 已验证（A 组）
 
 - ✅ 对本机基线（`v1.3.4` + `0001`–`0006`）**依次应用通过**，应用结果与主线提交
@@ -77,6 +101,12 @@
   mention gate: media message dropped project=my-workbuddy token=(media)
   mention gate: media message dropped project=my-project   token=(media)
   ```
+
+- ✅ 多点名（`0009`/`0010`，2026-09-20）：点名相关测试全绿
+  （`go test ./core/ -run 'TestMention|TestScanMention|TestNormalizeMention|TestBarePhoto|TestMediaRoute'`；
+  全包仅剩 2 个与 Windows 路径/符号链接有关的**既有**失败，与本功能无关）。
+  部署 `v1.3.4+mention.multicast` 并重启，启动日志三个 project 的 `mention gate enabled`
+  及 `default` / `media_default` 全部正确。微信端到端（真人发 `@wb @dsh …`）待实测记录。
 
 - ⚠️ **对上游 `main` 不能直接应用**（`0007` 在 `core/engine.go` 首个 hunk 冲突）。
   `0001`–`0006` 在上游 `main` 上仍然 6/6 干净，只有 A 组需要 rebase。
@@ -147,7 +177,8 @@ git am /path/to/patches/*.patch
 
 ```bash
 # 只要点名路由
-git am /path/to/patches/0007-*.patch /path/to/patches/0008-*.patch
+git am /path/to/patches/0007-*.patch /path/to/patches/0008-*.patch \
+       /path/to/patches/0009-*.patch /path/to/patches/0010-*.patch
 
 # 只要 hook-block 静默（跳过仅本机需要的 0003）
 git am /path/to/patches/0001-*.patch /path/to/patches/0002-*.patch \
@@ -161,16 +192,18 @@ git am /path/to/patches/0001-*.patch /path/to/patches/0002-*.patch \
 go build -ldflags "-s -w -X main.version=v1.3.4" -o cc-connect.exe ./cmd/cc-connect
 ```
 
-> Windows + git bash 注意：`git am` 的**参数路径别写成 `/d/...`**。
-> git 是原生 Windows 程序，会把 `/d/xxx` 解析成 `D:\d\xxx`（少一个反斜杠就差一个目录），
-> 表现为「文件明明在、git 说找不到」或补丁被写到诡异位置。用 `D:/xxx`。
+> Windows + git bash 注意：**所有原生 Windows 程序的路径参数都别写成 `/d/...`** ——
+> git、go 都会把 `/d/xxx` 解析成「当前盘符下的 `\d\xxx`」，即 `D:\d\xxx`。
+> 2026-09-20 实际踩了两遍：`git format-patch -o /d/...` 与 `go build -o /d/...`
+> 都**静默写到了 `D:\d\...`**（退出码 0、stdout 还打印了目标文件名，极具迷惑性）。
+> 一律用 `D:/xxx`，并在导出/构建后立刻 `ls` 验证产物真的落在目标目录。
 
 # 已验证（总览）
 
 | 项 | 结果 |
 |---|---|
-| 对基线 `v1.3.4` 完整 `git am` | ✅ `0001`–`0008` 全部干净应用 |
-| 对上游 `main`（tip `757b4df`，2026-09-10） | ⚠️ `0001`–`0006` **6/6 干净**；`0007`–`0008` **需 rebase** |
+| 对基线 `v1.3.4` 完整 `git am` | ✅ `0001`–`0010` 全部干净应用 |
+| 对上游 `main`（tip `757b4df`，2026-09-10） | ⚠️ `0001`–`0006` **6/6 干净**；`0007`–`0010` **需 rebase** |
 | A 组应用结果的正确性 | ✅ 与主线提交逐字节一致；编译 + 单测通过 |
 | B 组相关单测 | ✅ `go test ./core/ -run 'TestProcessInteractiveEvents_(HookBlocked|EmptyResponse)'` |
 
