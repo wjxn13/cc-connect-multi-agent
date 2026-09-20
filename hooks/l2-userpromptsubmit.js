@@ -72,17 +72,25 @@ try {
 }
 
 // ── 平台档案 ────────────────────────────────────────────────────────────────
-// others       : 「点名了别人」的前缀正则。负向先行断言 (?![a-z0-9_]) 避免把
-//                "@dshx" 之类误判成点名。
-// labels       : 别名 → 规范标签（理由里要写规范的那个）。
+// self         : 本 agent 自己的别名（小写、不带 @）。句首点名段里出现任一 → 放行。
+// labels       : 别人别名 → 规范标签（拦截理由里要写规范的那个）。
 // requireGate  : 是否要求 CC_BRIDGE_L2=1 才生效。
 //                claudecode 的钩子装在**全局** ~/.claude/settings.json 里，
 //                必须靠 env 门控，否则用户自己开的会话也会被拦；
 //                workbuddy 的钩子是用 --settings 只注入给桥接进程的，
 //                天然隔离，再加门控反而会因 env 漏配而静默失效 → 不要求。
+//
+// 🔴 2026-09-20 判定规则重写：从「行首第一个 @ 是不是别人」改为「**句首连续点名段**
+//    里有没有别人、且没有我」。原因：L1 多点名广播上线（cc-connect
+//    v1.3.4+mention.multicast）后，"@claude，@dsh，…" 会被关卡放行给两家；
+//    旧的行首锚定正则（/^@(claude|...)/）却仍然把 dsh 拦在模型之前 ——
+//    实测 l2-hook.jsonl：block=true namedAgent=@claude，用户什么也收不到。
+//    判定必须与 L1 对齐：段里有我 → 放行；段里只有别人 → 拦。
+//    段的解析与 core/engine.go scanLeadingMentionRun 一致：
+//    跳前导空白 → 循环「@name + 分隔符」；裸 @ 或非分隔符字符终止整段。
 const PROFILES = {
   claudecode: {
-    others: /^@(dsh|workbuddy|wb)(?![a-z0-9_])/i,
+    self: ['claude'],
     labels: { dsh: '@dsh', workbuddy: '@workbuddy', wb: '@wb' },
     requireGate: true,
     respond: (who) => ({
@@ -92,8 +100,8 @@ const PROFILES = {
   },
 
   workbuddy: {
-    // 本 agent 是 @wb / @workbuddy，所以「别人」是 @dsh / @claude。
-    others: /^@(dsh|claude)(?![a-z0-9_])/i,
+    // 本 agent 是 @wb / @workbuddy。
+    self: ['wb', 'workbuddy'],
     labels: { dsh: '@dsh', claude: '@claude' },
     requireGate: false,
     // ⚠️ reason 必须**恰好**是 NO_REPLY，不能多一个字。
@@ -104,8 +112,8 @@ const PROFILES = {
   },
 
   dsh: {
-    // 本 agent 是 @dsh，所以「别人」是 @claude / @wb / @workbuddy。
-    others: /^@(claude|workbuddy|wb)(?![a-z0-9_])/i,
+    // 本 agent 是 @dsh。
+    self: ['dsh'],
     labels: { claude: '@claude', workbuddy: '@workbuddy', wb: '@wb' },
     requireGate: false,
     // ⚠️ DSH 的阻断协议 —— 2026-09-16 读源码确认（比 README 更硬）：
@@ -170,6 +178,29 @@ function stripLeadingSystemReminder(text) {
   }
 }
 
+// 解析**句首连续点名段**：从第一个字符起，把连续的 `@名字` 全部读出来（小写、不带 @），
+// 名字之间允许空格 / `,` `，` / `、` / `;` `；` / `+` `&`；遇到裸 `@`（后面不是名字字符）
+// 或「既不是分隔符也不是 @」的字符即终止。与 cc-connect 的 scanLeadingMentionRun 同一套语义，
+// 两边不一致时会出现「L1 放行、L2 拦截」的左右互搏 —— 2026-09-20 实测踩过。
+function scanLeadingMentionRun(text) {
+  const s = String(text || '').replace(/^\s+/, '');
+  if (!s.startsWith('@')) return [];
+  const SEP = /^[\s,，、;；+&]+/;
+  const NAME = /^@([a-z0-9_-]+)/i;
+  const run = [];
+  let i = 0;
+  for (;;) {
+    const m = s.slice(i).match(NAME);
+    if (!m) break; // 裸 @ 或别的字符：不是点名，段到此为止
+    run.push(m[1].toLowerCase());
+    i += m[0].length;
+    const sep = s.slice(i).match(SEP);
+    if (!sep) break; // 名字后面不是分隔符：段结束
+    i += sep[0].length;
+  }
+  return run;
+}
+
 // 我方平台：优先取命令行参数 --agent <名>（自包含、不依赖 env 传递），
 // 其次取环境变量 CC_BRIDGE_AGENT，都缺则按 claudecode 处理。
 // 为什么优先命令行：WorkBuddy 的钩子是通过 --settings 注入的，把平台名写在同一行
@@ -201,11 +232,18 @@ process.stdin.on('end', () => {
   const matchText = stripLeadingSystemReminder(prompt);
   const gated = process.env[GATE_VAR] === '1';
   const gateOk = profile.requireGate ? gated : true;
-  const named = profile.others.exec(matchText);
-  const targetOther = named !== null;
+
+  // 句首点名段判定（2026-09-20 起，与 L1 对齐）：
+  //   段里有我                      → 放行（多播消息，每家都要答）；
+  //   段里没有我、但有别人          → 拦（namedAgent 记段里第一个别人）；
+  //   没有段（不以 @ 开头 / 裸 @）  → 放行（L1 的 default 决定去留，不归 L2 管）。
+  const run = scanLeadingMentionRun(matchText);
+  const selfHit = run.some((n) => profile.self.includes(n));
+  const otherName = run.find((n) => Object.prototype.hasOwnProperty.call(profile.labels, n));
+  const targetOther = run.length > 0 && !selfHit && otherName !== undefined;
   const block = gateOk && targetOther;
 
-  const who = named ? profile.labels[named[1].toLowerCase()] : null;
+  const who = targetOther ? profile.labels[otherName] : null;
 
   writeLog({
     ts: new Date().toISOString(),
@@ -215,6 +253,7 @@ process.stdin.on('end', () => {
     targetOther,
     block,
     namedAgent: who,
+    run,
     promptHead: prompt.slice(0, 60),
     // 与 promptHead 不同的唯一情形 = 开头确实有注入块被剥掉了。排查「为什么没拦住」时先看这里。
     matchHead: matchText.slice(0, 60),
